@@ -31,7 +31,7 @@ static void print_usage(int, char ** argv) {
             "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
             "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
             "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
-            "       [--show-statistics] [...]\n" , argv[0]);
+            "       [--show-statistics] [--tensor-filter PREFIX] [...]\n" , argv[0]);
     LOG("\n");
 }
 
@@ -248,6 +248,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // why are small batches ignored (<16 tokens)?
         if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
         if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) return false;
+        // when tensor_filter_prefix is set, only collect tensors whose names start with the prefix
+        if (!m_params.tensor_filter_prefix.empty()) {
+            if (wname.rfind(m_params.tensor_filter_prefix, 0) != 0) return false;
+        }
         return true;
     }
 
