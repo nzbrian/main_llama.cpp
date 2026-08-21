@@ -3178,6 +3178,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--stream-combine"},
+        string_format("combine imatrix files one at a time instead of loading all into memory (default: %s)", params.stream_combine ? "true" : "false"),
+        [](common_params & params) {
+            params.stream_combine = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--show-statistics"},
         string_format("show imatrix statistics and then exit (default: %s)", params.show_statistics ? "true" : "false"),
         [](common_params & params) {

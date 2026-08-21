@@ -1086,12 +1086,21 @@ int main(int argc, char ** argv) {
     params.out_file = "imatrix.gguf";
 
     params.n_ctx = 512;
+    params.n_batch = 512; // reduced for imatrix to limit activation memory
     params.escape = false;
 
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
         return 1;
+    }
+
+    // When using --tensor-filter, perplexity is not needed for imatrix collection
+    // and adds unnecessary memory overhead for logit histories. Disable automatically.
+    if (!params.tensor_filter_prefix.empty() && params.compute_ppl) {
+        LOG_INF("%s: tensor_filter_prefix set — disabling perplexity (use --ppl to override)\n",
+                __func__);
+        params.compute_ppl = false;
     }
 
     // set_params before show_statistics so load_imatrix has valid n_ctx/n_parallel

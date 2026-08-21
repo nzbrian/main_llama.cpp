@@ -706,6 +706,7 @@ struct common_params {
     bool compute_ppl     = true;  // whether to compute perplexity
     bool show_statistics = false; // show imatrix statistics per tensor
     std::string tensor_filter_prefix; // only collect imatrix data for tensors whose names start with this prefix (empty = all)
+    bool stream_combine  = false; // combine imatrix files one at a time instead of loading all into memory
     bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params
