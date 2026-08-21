@@ -248,9 +248,13 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // why are small batches ignored (<16 tokens)?
         if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
         if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) return false;
-        // when tensor_filter_prefix is set, only collect tensors whose names start with the prefix
+        // when tensor_filter_prefix is set, only collect tensors whose names start with any of the prefixes
         if (!m_params.tensor_filter_prefix.empty()) {
-            if (wname.rfind(m_params.tensor_filter_prefix, 0) != 0) return false;
+            bool matched = false;
+            for (const auto & prefix : m_params.tensor_filter_prefix) {
+                if (wname.rfind(prefix, 0) == 0) { matched = true; break; }
+            }
+            if (!matched) return false;
         }
         return true;
     }
@@ -337,12 +341,16 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
 
         // check for non-finite values, only checking experts that were routed to and touched
+        // Skip tensors with non-finite values instead of crashing (can happen with MoE gate weights in FP16 on CUDA)
+        bool has_nonfinite = false;
         for (int64_t ex = 0; ex < n_as; ++ex) {
             if (touched[ex] && !all_finite(e.values.data() + ex * ne0, ne0)) {
-                LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
-                exit(1);
+                LOG_WRN("%s: non-finite values detected in %s (expert %ld), skipping this tensor\n",
+                        __func__, wname.c_str(), ex);
+                has_nonfinite = true;
             }
         }
+        if (!has_nonfinite) {
 
         for (int64_t ex = 0; ex < n_as; ++ex) {
             const int32_t n_chunk = e.counts[ex] / chunk_size;
@@ -356,6 +364,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     save_imatrix(m_last_chunk);
                 }
             }
+        }
         }
     } else {
         auto & e = m_stats[wname];
@@ -404,9 +413,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         // check for non-finite values
         if (!all_finite(e.values.data(), e.values.size())) {
-            LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
-            exit(1);
-        }
+            LOG_WRN("%s: non-finite values detected in %s, skipping this tensor\n",
+                    __func__, wname.c_str());
+        } else {
         // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
         for (size_t i = 0; i < e.counts.size(); ++i) {
             e.counts[i] += ggml_nrows(src1) / n_mat;
@@ -421,6 +430,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     save_imatrix(m_last_chunk);
                 }
             }
+        }
         }
     }
 
@@ -1102,6 +1112,8 @@ int main(int argc, char ** argv) {
                 __func__);
         params.compute_ppl = false;
     }
+
+
 
     // set_params before show_statistics so load_imatrix has valid n_ctx/n_parallel
     g_collector.set_params(params);

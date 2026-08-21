@@ -3172,9 +3172,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
         {"--tensor-filter"}, "PREFIX",
-        string_format("only collect imatrix data for tensors whose names start with PREFIX (default: '%s')", params.tensor_filter_prefix.c_str()),
+        string_format("only collect imatrix data for tensors whose names start with PREFIX (can be specified multiple times; empty = all)"),
         [](common_params & params, const std::string & value) {
-            params.tensor_filter_prefix = value;
+            params.tensor_filter_prefix.push_back(value);
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
