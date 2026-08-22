@@ -3185,6 +3185,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--stream-imatrix-dir"}, "DIR",
+        "stream per-tensor imatrix statistics to DIR during a single forward pass (low-memory mode); writes one file per tensor after each chunk, bypassing the in-memory m_stats map. Use a different disk than the model for best I/O performance.",
+        [](common_params & params, const std::string & value) {
+            params.stream_imatrix_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--show-statistics"},
         string_format("show imatrix statistics and then exit (default: %s)", params.show_statistics ? "true" : "false"),
         [](common_params & params) {

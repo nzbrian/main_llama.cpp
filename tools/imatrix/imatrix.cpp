@@ -20,6 +20,7 @@
 #include <map>
 #include <regex>
 #include <numeric>
+#include <filesystem>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -31,7 +32,9 @@ static void print_usage(int, char ** argv) {
             "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
             "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
             "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
-            "       [--show-statistics] [--tensor-filter PREFIX] [...]\n" , argv[0]);
+            "       [--show-statistics] [--tensor-filter PREFIX] [...] \
+"
+            "       [--stream-imatrix-dir DIR]\n", argv[0]);
     LOG("\n");
 }
 
@@ -61,8 +64,12 @@ public:
     void set_params(common_params params) { m_params = std::move(params); }
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
-    void save_imatrix(int32_t n_chunk = -1) const;
+    void save_immatrix(int32_t n_chunk = -1) const;
     bool load_imatrix(const char * file_name);
+    void stream_flush();
+    void stream_finalize();
+    void set_streaming(bool streaming, const std::string & dir) { m_streaming = streaming; m_stream_dir = dir; }
+    bool get_streaming() const { return m_streaming; }
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
 private:
     std::unordered_map<std::string, Stats> m_stats;
@@ -72,6 +79,8 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    bool                                   m_streaming = false;
+    std::string                            m_stream_dir;
 };
 
 // remove any prefix and suffixes from the name
@@ -248,8 +257,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // why are small batches ignored (<16 tokens)?
         if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
         if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) return false;
-        // when tensor_filter_prefix is set, only collect tensors whose names start with any of the prefixes
-        if (!m_params.tensor_filter_prefix.empty()) {
+        // when tensor_filter_prefix is set and NOT streaming, only collect tensors whose names start with any of the prefixes
+        // in streaming mode, we collect ALL tensors (bypassing filter) to avoid multiple forward passes
+        if (!m_params.tensor_filter_prefix.empty() && !m_streaming) {
             bool matched = false;
             for (const auto & prefix : m_params.tensor_filter_prefix) {
                 if (wname.rfind(prefix, 0) == 0) { matched = true; break; }
@@ -358,10 +368,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 const int32_t chunk_step = n_chunk - m_last_chunk;
                 m_last_chunk = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
-                    save_imatrix();
+                    save_immatrix();
                 }
                 if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
-                    save_imatrix(m_last_chunk);
+                    save_immatrix(m_last_chunk);
                 }
             }
         }
@@ -424,10 +434,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 const int32_t chunk_step = n_chunk - m_last_chunk;
                 m_last_chunk = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
-                    save_imatrix();
+                    save_immatrix();
                 }
                 if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
-                    save_imatrix(m_last_chunk);
+                    save_immatrix(m_last_chunk);
                 }
             }
         }
@@ -543,7 +553,7 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
     LOG_DBGV(1, "%s: stored collected data after %d chunks in %s\n", __func__, m_last_chunk, fname.c_str());
 }
 
-void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
+void IMatrixCollector::save_immatrix(int32_t n_chunk) const {
     auto fname = m_params.out_file;
     int8_t use_legacy_format = m_params.imat_dat;
 
@@ -651,6 +661,88 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
     gguf_free(ctx_gguf);
     ggml_free(ctx);
+}
+
+// Stream per-tensor statistics to disk after each chunk.
+// Each tensor's current values and counts are written to a separate .gguf file
+// in the stream directory. The Python incremental combine function can later
+// merge these files using standard imatrix combination logic.
+void IMatrixCollector::stream_flush() {
+    if (!m_streaming || m_stats.empty()) return;
+
+    // Create the stream directory if it doesn't exist
+    std::error_code ec;
+    std::filesystem::create_directories(m_stream_dir, ec);
+
+    for (const auto & kv : m_stats) {
+        const std::string & name = kv.first;
+        const Stats & stat = kv.second;
+
+        // Sanitize tensor name for use as filename
+        std::string safe_name = name;
+        std::replace(safe_name.begin(), safe_name.end(), '.', '_');
+        std::replace(safe_name.begin(), safe_name.end(), '/', '_');
+
+        std::string fname = m_stream_dir + "/stream_" + safe_name + ".gguf";
+
+        struct gguf_context * ctx_gguf = gguf_init_empty();
+
+        const int32_t nval = (int32_t) stat.values.size();
+        const int32_t nmat = (int32_t) stat.counts.size();
+
+        if (nval > 0 && nmat > 0) {
+            // Allocate ggml context for tensor data
+            size_t data_size = GGML_PAD(ggml_tensor_overhead() + sizeof(float) * nval, GGML_MEM_ALIGN)
+                             + GGML_PAD(ggml_tensor_overhead() + sizeof(float) * nmat, GGML_MEM_ALIGN);
+
+            struct ggml_init_params params = { data_size, NULL, false };
+            struct ggml_context * ctx = ggml_init(params);
+
+            struct ggml_tensor * in_sum2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nval / nmat, nmat);
+            struct ggml_tensor * counts  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, nmat);
+            ggml_format_name(in_sum2, "%s.in_sum2", name.c_str());
+            ggml_format_name(counts, "%s.counts", name.c_str());
+
+            for (int32_t j = 0; j < nval; ++j) {
+                ((float *) in_sum2->data)[j] = (float) stat.values[j];
+            }
+            for (int32_t j = 0; j < nmat; ++j) {
+                ((float *) counts->data)[j] = (float) stat.counts[j];
+            }
+
+            gguf_add_tensor(ctx_gguf, in_sum2);
+            gguf_add_tensor(ctx_gguf, counts);
+
+            // Write metadata
+            std::vector<const char *> datasets;
+            for (size_t i = 0; i < m_datasets.size(); ++i) {
+                datasets.push_back(m_datasets[i].c_str());
+            }
+            if (!m_params.prompt_file.empty()) {
+                datasets.push_back(m_params.prompt_file.c_str());
+            }
+
+            gguf_set_val_str(ctx_gguf, "general.type", "imatrix_stream");
+            gguf_set_arr_str(ctx_gguf, LLM_KV_IMATRIX_DATASETS, datasets.data(), datasets.size());
+            gguf_set_val_u32(ctx_gguf, LLM_KV_IMATRIX_CHUNK_COUNT, m_last_chunk);
+            gguf_set_val_u32(ctx_gguf, LLM_KV_IMATRIX_CHUNK_SIZE, m_params.n_ctx / m_params.n_parallel);
+
+            gguf_write_to_file(ctx_gguf, fname.c_str(), false);
+
+            ggml_free(ctx);
+        }
+
+        gguf_free(ctx_gguf);
+    }
+
+    // Clear in-memory stats to free memory for next chunk
+    m_stats.clear();
+}
+
+// Finalize streaming: if any stats remain (from the last chunk), flush them.
+void IMatrixCollector::stream_finalize() {
+    stream_flush();
+    LOG_INF("%s: streaming complete, partial files written to %s\n", __func__, m_stream_dir.c_str());
 }
 
 bool IMatrixCollector::load_imatrix(const char * file_name) {
@@ -957,6 +1049,12 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
             logits.clear();
         }
+
+        // In streaming mode, flush per-tensor stats to disk after each chunk
+        // to keep memory usage bounded at O(one_chunk_of_tensors) instead of O(all_tensors)
+        if (g_collector.get_streaming()) {
+            g_collector.stream_flush();
+        }
     }
 
     LOG("\n");
@@ -1166,7 +1264,7 @@ int main(int argc, char ** argv) {
             LOG_INF("%s : saving combined imatrix to '%s'\n", __func__, params.out_file.c_str());
         }
 
-        g_collector.save_imatrix();
+        g_collector.save_immatrix();
 
         return 0;
     }
@@ -1203,11 +1301,28 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
+    // Set up streaming mode if --stream-imatrix-dir is specified.
+    // In streaming mode:
+    // - ALL tensors are collected in a single forward pass (tensor_filter is bypassed)
+    // - After each chunk, per-tensor stats are flushed to disk files in the stream directory
+    // - This reduces total I/O by N× (no repeated forward passes for different tensor groups)
+    // - Memory usage stays at O(one_chunk_of_tensors) instead of O(all_tensors)
+    // - The streamed files can be combined using loq's Python incremental combine function
+    if (!params.stream_imatrix_dir.empty()) {
+        g_collector.set_streaming(true, params.stream_imatrix_dir);
+        LOG_INF("%s: streaming mode enabled, writing per-tensor stats to %s\n", __func__, params.stream_imatrix_dir.c_str());
+    }
+
     if (!compute_imatrix(ctx, params, n_ctx)) {
         return 1;
     }
 
-    g_collector.save_imatrix();
+    if (g_collector.get_streaming()) {
+        g_collector.stream_finalize();
+        LOG_INF("%s: streaming complete. Combine files in %s using loq's Python incremental combine.\n", __func__, params.stream_imatrix_dir.c_str());
+    } else {
+        g_collector.save_immatrix();
+    }
 
     LOG("\n");
     llama_perf_context_print(ctx);
