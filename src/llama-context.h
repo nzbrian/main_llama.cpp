@@ -247,6 +247,12 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // EXPERIMENTAL: per-tensor input-activation energy accumulation (see llama.h)
+    void tensor_energy_enable(bool enabled);
+    int tensor_energy_count() const;
+    const char * tensor_energy_name(int i) const;
+    double tensor_energy_sum(int i) const;
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -391,4 +397,17 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // EXPERIMENTAL: per-tensor input-activation energy accumulation
+    void tensor_energy_accumulate(const ggml_cgraph * gf);
+    bool tensor_energy_enabled = false;
+    bool tensor_energy_index_built = false;
+    std::vector<std::string> tensor_energy_names;
+    std::vector<double> tensor_energy_sums;
+    std::unordered_map<const void *, size_t> tensor_energy_obj_index;  // ggml_tensor * -> index
+    std::unordered_map<const void *, size_t> tensor_energy_ptr_index;  // data ptr    -> index
+    // graph weights can be backend-buffer copies (different object AND data
+    // pointer than the model tensor); their ggml name embeds the tensor name
+    // as "<device>#<name>#<n>", so a name index is the robust fallback
+    std::unordered_map<std::string, size_t> tensor_energy_name_index;  // tensor name -> index
 };

@@ -2011,6 +2011,23 @@ int llama_perplexity(int argc, char ** argv);
 int llama_perplexity(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    // EXPERIMENTAL: extract --tensor-energies <file> before common parsing.
+    // new_argv must outlive common_params_parse (argv points into it).
+    std::string tensor_energies_file;
+    std::vector<char *> new_argv;
+    new_argv.reserve(size_t(argc) + 1);
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--tensor-energies") == 0 && i + 1 < argc) {
+            tensor_energies_file = argv[i + 1];
+            ++i;
+        } else {
+            new_argv.push_back(argv[i]);
+        }
+    }
+    new_argv.push_back(nullptr);
+    argc = int(new_argv.size()) - 1;
+    argv = new_argv.data();
+
     common_params params;
 
     params.n_ctx = 512;
@@ -2075,6 +2092,11 @@ int llama_perplexity(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
+    if (!tensor_energies_file.empty()) {
+        llama_tensor_energy_enable(ctx, true);
+        LOG_INF("tensor-energies: accumulation enabled, will write %s\n", tensor_energies_file.c_str());
+    }
+
     struct results_perplexity results;
     if (params.hellaswag) {
         hellaswag_score(ctx, params);
@@ -2086,6 +2108,24 @@ int llama_perplexity(int argc, char ** argv) {
         kl_divergence(ctx, params);
     } else {
         results = perplexity(ctx, params, n_ctx);
+    }
+
+    if (!tensor_energies_file.empty()) {
+        const int n = llama_tensor_energy_count(ctx);
+        std::ofstream out(tensor_energies_file);
+        if (!out) {
+            LOG_ERR("tensor-energies: failed to open %s for writing\n", tensor_energies_file.c_str());
+            return 1;
+        }
+        out << "{\n  \"tensors\": [\n";
+        for (int i = 0; i < n; ++i) {
+            out << "    {\"name\": \"" << llama_tensor_energy_name(ctx, i) << "\", "
+                << "\"sum_sq\": " << llama_tensor_energy_sum(ctx, i) << "}"
+                << (i + 1 < n ? ",\n" : "\n");
+        }
+        out << "  ]\n}\n";
+        out.close();
+        LOG_INF("tensor-energies: wrote %d tensors to %s\n", n, tensor_energies_file.c_str());
     }
 
     LOG("\n");

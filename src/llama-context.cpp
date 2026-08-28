@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -19,6 +21,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
@@ -1397,6 +1400,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (tensor_energy_enabled) {
+        tensor_energy_accumulate(res->get_gf());
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2350,6 +2357,220 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+//
+// EXPERIMENTAL: per-tensor input-activation energy accumulation
+//
+
+void llama_context::tensor_energy_enable(bool enabled) {
+    if (tensor_energy_enabled == enabled) {
+        return;
+    }
+    tensor_energy_enabled = enabled;
+    if (enabled) {
+        tensor_energy_names.clear();
+        tensor_energy_sums.clear();
+        tensor_energy_obj_index.clear();
+        tensor_energy_ptr_index.clear();
+        tensor_energy_index_built = false;
+    }
+}
+
+int llama_context::tensor_energy_count() const {
+    return (int) tensor_energy_names.size();
+}
+
+const char * llama_context::tensor_energy_name(int i) const {
+    return tensor_energy_names[(size_t) i].c_str();
+}
+
+double llama_context::tensor_energy_sum(int i) const {
+    return tensor_energy_sums[(size_t) i];
+}
+
+void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
+    if (!tensor_energy_index_built) {
+        const auto & tensor_map = llama_internal_get_tensor_map(&model);
+        for (const auto & entry : tensor_map) {
+            const std::string & name = entry.first;
+            const ggml_tensor * t = entry.second;
+            if (t == nullptr || t->data == nullptr) {
+                continue;
+            }
+            const size_t idx = tensor_energy_names.size();
+            tensor_energy_names.push_back(name);
+            tensor_energy_sums.push_back(0.0);
+            tensor_energy_obj_index[t] = idx;
+            tensor_energy_ptr_index[t->data] = idx;
+            tensor_energy_name_index[name] = idx;
+        }
+        tensor_energy_index_built = true;
+    }
+
+    // match a graph src against the model-tensor index:
+    //  1. ggml object identity
+    //  2. data pointer
+    //  3. tensor name embedded in the src name (backend weight copies are
+    //     named "<device>#<tensor_name>#<n>"; plain names match directly)
+    auto match_src = [&](const ggml_tensor * src) -> size_t {
+        auto it_obj = tensor_energy_obj_index.find(src);
+        if (it_obj != tensor_energy_obj_index.end()) {
+            return it_obj->second;
+        }
+        auto it_ptr = tensor_energy_ptr_index.find(src->data);
+        if (it_ptr != tensor_energy_ptr_index.end()) {
+            return it_ptr->second;
+        }
+        // name fallback with a BOUNDED scan (name[] in a recycled pool slot
+        // is not guaranteed to be NUL-terminated; never use strlen/strchr)
+        const unsigned char * name = reinterpret_cast<const unsigned char *>(src->name);
+        size_t len = 0;
+        while (len < GGML_MAX_NAME && name[len] != 0) {
+            ++len;
+        }
+        if (len >= GGML_MAX_NAME) {
+            return SIZE_MAX;  // unterminated -> treat as malformed
+        }
+        const char * first = nullptr;
+        const char * last = nullptr;
+        for (size_t k = 0; k < len; ++k) {
+            if (name[k] == '#') {
+                if (first == nullptr) {
+                    first = reinterpret_cast<const char *>(name) + k;
+                }
+                last = reinterpret_cast<const char *>(name) + k;
+            }
+        }
+        if (first != nullptr) {
+            const char * begin = first + 1;
+            if (last != nullptr && last > begin) {
+                auto it = tensor_energy_name_index.find(std::string(begin, last - begin));
+                return it != tensor_energy_name_index.end() ? it->second : SIZE_MAX;
+            }
+            return SIZE_MAX;
+        }
+        auto it = tensor_energy_name_index.find(std::string(reinterpret_cast<const char *>(name), len));
+        return it != tensor_energy_name_index.end() ? it->second : SIZE_MAX;
+    };
+
+    // DEBUG (temporary): per-call counters
+    static int dbg_calls = 0;
+    int dbg_param = 0, dbg_nonhost = 0, dbg_nomatch = 0, dbg_nosrc = 0;
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * c = gf->nodes[i];
+        if (c == nullptr) {
+            continue;
+        }
+        // identify the model-parameter src and the largest co-occurring
+        // non-parameter src (the op input activation)
+        size_t param_idx = SIZE_MAX;
+        const ggml_tensor * x = nullptr;
+        int64_t x_bytes = -1;
+        int n_srcs = 0;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            n_srcs += (c->src[s] != nullptr);
+            if (n_srcs >= 2) {
+                break;
+            }
+        }
+        if (n_srcs < 2) {
+            dbg_nosrc++;
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = c->src[s];
+            if (src == nullptr || src->data == nullptr) {
+                continue;
+            }
+            const size_t matched = match_src(src);
+            if (dbg_calls == 0 && dbg_nomatch < 10000) {
+                // DEBUG (temporary): trace name-based match outcomes
+                FILE * fdbg2 = fopen("/tmp/energy_names.txt", "a");
+                if (fdbg2) {
+                    fprintf(fdbg2, "src name='%s' matched=%s\n", src->name,
+                            matched != SIZE_MAX ? "HIT" : "miss");
+                    fclose(fdbg2);
+                }
+            }
+            if (matched != SIZE_MAX) {
+                if (param_idx == SIZE_MAX) {
+                    param_idx = matched;
+                }
+                continue;
+            }
+            const int64_t bytes = ggml_nbytes(src);
+            if (bytes > x_bytes) {
+                x_bytes = bytes;
+                x = src;
+            }
+        }
+        if (param_idx == SIZE_MAX || x == nullptr) {
+            dbg_nomatch++;
+            continue;
+        }
+        dbg_param++;
+        // only host-resident activations are readable from here (fused ops
+        // running on CUDA leave their activations in GPU memory)
+        {
+            const ggml_backend_buffer_t xbuf = x->buffer;
+            if (xbuf != nullptr && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(xbuf))) {
+                dbg_nonhost++;
+                continue;
+            }
+        }
+        // accumulate the sum of squares of the activation (host memory)
+        double ss = 0.0;
+        const int64_t n = ggml_nelements(x);
+        switch (x->type) {
+            case GGML_TYPE_F32: {
+                const float * p = (const float *) x->data;
+                double acc[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+                int64_t k = 0;
+                for (; k + 8 <= n; k += 8) {
+                    for (int u = 0; u < 8; ++u) {
+                        acc[u] += p[k + u] * p[k + u];
+                    }
+                }
+                for (; k < n; ++k) {
+                    acc[0] += p[k] * p[k];
+                }
+                for (int u = 0; u < 8; ++u) {
+                    ss += acc[u];
+                }
+                break;
+            }
+            case GGML_TYPE_F16: {
+                const ggml_fp16_t * p = (const ggml_fp16_t *) x->data;
+                for (int64_t k = 0; k < n; ++k) {
+                    const float v = ggml_fp16_to_fp32(p[k]);
+                    ss += v * v;
+                }
+                break;
+            }
+            case GGML_TYPE_BF16: {
+                const ggml_bf16_t * p = (const ggml_bf16_t *) x->data;
+                for (int64_t k = 0; k < n; ++k) {
+                    const float v = ggml_bf16_to_fp32(p[k]);
+                    ss += v * v;
+                }
+                break;
+            }
+            default:
+                break; // skip non-float compute types
+        }
+        tensor_energy_sums[param_idx] += ss;
+    }
+
+    if (true) {
+        FILE * fdbg = fopen("/tmp/energy_stats.txt", "a");
+        if (fdbg) {
+            fprintf(fdbg, "call=%d param=%d nonhost=%d nomatch=%d nosrc=%d\n",
+                    dbg_calls, dbg_param, dbg_nonhost, dbg_nomatch, dbg_nosrc);
+            fclose(fdbg);
+        }
+    }
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -3738,6 +3959,23 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+}
+
+// EXPERIMENTAL: per-tensor input-activation energy accumulation (see llama.h)
+void llama_tensor_energy_enable(struct llama_context * ctx, bool enabled) {
+    ctx->tensor_energy_enable(enabled);
+}
+
+int llama_tensor_energy_count(struct llama_context * ctx) {
+    return ctx->tensor_energy_count();
+}
+
+const char * llama_tensor_energy_name(struct llama_context * ctx, int i) {
+    return ctx->tensor_energy_name(i);
+}
+
+double llama_tensor_energy_sum(struct llama_context * ctx, int i) {
+    return ctx->tensor_energy_sum(i);
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {

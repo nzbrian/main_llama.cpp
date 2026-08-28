@@ -550,6 +550,19 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
+    // EXPERIMENTAL: per-tensor input-activation energy accumulation.
+    // When enabled, after every computed graph, each graph node that has a
+    // model-parameter source tensor contributes the sum of squares of its
+    // co-occurring largest non-parameter source tensor (the op input
+    // activation) to the counter of that parameter. The result is an
+    // approximation of the GPTQ-style input Gram-matrix diagonal entry
+    // ||X_t||^2_F per tensor t over the evaluated tokens. CPU backends only
+    // (activations must be host memory).
+    LLAMA_API void llama_tensor_energy_enable(struct llama_context * ctx, bool enabled);
+    LLAMA_API int llama_tensor_energy_count(struct llama_context * ctx);
+    LLAMA_API const char * llama_tensor_energy_name(struct llama_context * ctx, int i);
+    LLAMA_API double llama_tensor_energy_sum(struct llama_context * ctx, int i);
+
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);
