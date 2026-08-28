@@ -2454,10 +2454,6 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
         return it != tensor_energy_name_index.end() ? it->second : SIZE_MAX;
     };
 
-    // DEBUG (temporary): per-call counters
-    static int dbg_calls = 0;
-    int dbg_param = 0, dbg_nonhost = 0, dbg_nomatch = 0, dbg_nosrc = 0;
-
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * c = gf->nodes[i];
         if (c == nullptr) {
@@ -2467,6 +2463,7 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
         // non-parameter src (the op input activation)
         size_t param_idx = SIZE_MAX;
         const ggml_tensor * x = nullptr;
+        const void * x_data = nullptr;
         int64_t x_bytes = -1;
         int n_srcs = 0;
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -2476,7 +2473,6 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
             }
         }
         if (n_srcs < 2) {
-            dbg_nosrc++;
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -2485,15 +2481,6 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
                 continue;
             }
             const size_t matched = match_src(src);
-            if (dbg_calls == 0 && dbg_nomatch < 10000) {
-                // DEBUG (temporary): trace name-based match outcomes
-                FILE * fdbg2 = fopen("/tmp/energy_names.txt", "a");
-                if (fdbg2) {
-                    fprintf(fdbg2, "src name='%s' matched=%s\n", src->name,
-                            matched != SIZE_MAX ? "HIT" : "miss");
-                    fclose(fdbg2);
-                }
-            }
             if (matched != SIZE_MAX) {
                 if (param_idx == SIZE_MAX) {
                     param_idx = matched;
@@ -2507,25 +2494,33 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
             }
         }
         if (param_idx == SIZE_MAX || x == nullptr) {
-            dbg_nomatch++;
             continue;
         }
-        dbg_param++;
+        x_data = x->data;
         // only host-resident activations are readable from here (fused ops
         // running on CUDA leave their activations in GPU memory)
         {
             const ggml_backend_buffer_t xbuf = x->buffer;
             if (xbuf != nullptr && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(xbuf))) {
-                dbg_nonhost++;
-                continue;
+                // device-resident activation: pull it into a host staging
+                // buffer before accumulating
+                if (!ggml_is_contiguous(x)) {
+                    continue;
+                }
+                const size_t nbytes = (size_t) ggml_nbytes(x);
+                if (tensor_energy_staging.size() < nbytes) {
+                    tensor_energy_staging.resize(nbytes);
+                }
+                ggml_backend_tensor_get(x, tensor_energy_staging.data(), 0, nbytes);
+                x_data = tensor_energy_staging.data();
             }
         }
-        // accumulate the sum of squares of the activation (host memory)
+        // accumulate the sum of squares of the activation
         double ss = 0.0;
         const int64_t n = ggml_nelements(x);
         switch (x->type) {
             case GGML_TYPE_F32: {
-                const float * p = (const float *) x->data;
+                const float * p = (const float *) x_data;
                 double acc[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
                 int64_t k = 0;
                 for (; k + 8 <= n; k += 8) {
@@ -2542,7 +2537,7 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
                 break;
             }
             case GGML_TYPE_F16: {
-                const ggml_fp16_t * p = (const ggml_fp16_t *) x->data;
+                const ggml_fp16_t * p = (const ggml_fp16_t *) x_data;
                 for (int64_t k = 0; k < n; ++k) {
                     const float v = ggml_fp16_to_fp32(p[k]);
                     ss += v * v;
@@ -2550,7 +2545,7 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
                 break;
             }
             case GGML_TYPE_BF16: {
-                const ggml_bf16_t * p = (const ggml_bf16_t *) x->data;
+                const ggml_bf16_t * p = (const ggml_bf16_t *) x_data;
                 for (int64_t k = 0; k < n; ++k) {
                     const float v = ggml_bf16_to_fp32(p[k]);
                     ss += v * v;
@@ -2561,15 +2556,6 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
                 break; // skip non-float compute types
         }
         tensor_energy_sums[param_idx] += ss;
-    }
-
-    if (true) {
-        FILE * fdbg = fopen("/tmp/energy_stats.txt", "a");
-        if (fdbg) {
-            fprintf(fdbg, "call=%d param=%d nonhost=%d nomatch=%d nosrc=%d\n",
-                    dbg_calls, dbg_param, dbg_nonhost, dbg_nomatch, dbg_nosrc);
-            fclose(fdbg);
-        }
     }
 }
 

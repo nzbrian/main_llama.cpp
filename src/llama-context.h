@@ -410,4 +410,5 @@ private:
     // pointer than the model tensor); their ggml name embeds the tensor name
     // as "<device>#<name>#<n>", so a name index is the robust fallback
     std::unordered_map<std::string, size_t> tensor_energy_name_index;  // tensor name -> index
+    std::vector<uint8_t> tensor_energy_staging;  // host staging for device activations
 };
