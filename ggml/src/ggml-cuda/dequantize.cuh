@@ -450,3 +450,20 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_mxfp8 * x = (const block_mxfp8 *) vx + ibs*(QK_K/QK_MXFP8);
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 8*il;
+    const uint8_t * q8 = x[ib].qs + 8*il;
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t v = q8[j];
+        const float   s = (v & 0x80) ? -1.0f : 1.0f;
+        y[j] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp8[v & 0x7F] * s);
+    }
+}
