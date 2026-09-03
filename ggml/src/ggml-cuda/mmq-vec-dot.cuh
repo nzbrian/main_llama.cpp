@@ -1238,3 +1238,74 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// MXFP8 MMA kernel on Blackwell. Identical structure and register fragment layout to the FP4
+// kernel above (same tile<16,8,int>/tile<8,8,int> ldmatrix loads and q8_1 B/scale loads); the only
+// differences are the mma_block_scaled_fp8 call (mxf8f6f4, m16n8k32, e4m3) and that each block
+// carries one E8M0 scale (scale_vec::1X) rather than two packed (scale_vec::2X). Because each
+// ldmatrix fragment therefore spans K=32 (not K=64), the per-call K is half the FP4 value, which
+// is handled by the smaller K_vram (256 vs 512) in the config and the default ne_block.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp8_fp8_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+    constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J;
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int *      x_qs = (const int *) x;
+    const uint32_t * x_sc = (const uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
+    const int *      y_qs = (const int *) y + 4;
+    const uint32_t * y_sc = (const uint32_t *) y;
+
+    // 2 threads per quad supply the packed scale register to the block_scale MMA,
+    // see https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-block-scaling
+    const int tidx_A = threadIdx.x / 4 + (threadIdx.x % 2) * 8;
+    const int tidx_B = threadIdx.x / 4;
+    const int i0     = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A   A[ntx][nfrags];
+    uint32_t scaleA[ntx][nfrags];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            load_ldmatrix(A[n][frag], x_qs + (i0 + n * tile_A::I) * sram_stride + k0, sram_stride);
+            scaleA[n][frag] = x_sc[(i0 + n * tile_A::I + tidx_A) * sram_stride + k0 / tile_A::J];
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+        tile_B   B[nfrags];
+        uint32_t scaleB[nfrags];
+
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = frag * tile_B::J;
+            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
+            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                tile_C C = {};
+                mma_block_scaled_fp8<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];
+                }
+            }
+        }
+    }
+}
+

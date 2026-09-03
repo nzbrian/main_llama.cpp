@@ -1169,8 +1169,8 @@ namespace ggml_cuda_mma {
 
         asm volatile(
             "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-            "{\%0, \%1, \%2, \%3}, {\%4, \%5, \%6, \%7}, {\%8, \%9}, {\%0, \%1, \%2, \%3}, "
-            "\%10, {0, 0}, \%11, {0, 0};"
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+            "%10, {0, 0}, %11, {0, 0};"
             : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
 #else

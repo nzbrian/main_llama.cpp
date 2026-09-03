@@ -32,6 +32,25 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
+    // MXFP8: reuses the FP4 SRAM layout (same stride: 64-int quant region holds 8 FP8 blocks of
+    // 32 E4M3 each, scale region holds 8 single E8M0). K_vram is 256 (8 blocks), half the FP4
+    // value, because each m16n8k32 MMA spans K=32 (not K=64).
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, true);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, true);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, true);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, true);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, true);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
+    CASE(GGML_TYPE_MXFP8, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, 256, true, false);
 
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

@@ -291,6 +291,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
             break;
+        case GGML_TYPE_MXFP8:
+            // The FP8 block-scaled tensor-core MMQ path (mxf8f6f4) exists only on Blackwell;
+            // on other archs there is no dequant-dp4a kernel, so fall back to cuBLAS (dequant).
+            mmq_supported = cc >= GGML_CUDA_CC_BLACKWELL;
+            break;
         default:
             mmq_supported = false;
             break;
