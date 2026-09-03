@@ -449,11 +449,13 @@ void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RE
             }
         }
 
-        // E8M0 scale: with GGML_E8M0_TO_FP32_HALF(e) = 2^(e-128), choosing
-        // e = floor(log2(amax)) - 8 + 128 gives d = 2^(floor(log2(amax))-8), so
+        // E8M0 scale: with GGML_E8M0_TO_FP32(e) = 2^(e-127), choosing
+        // e = floor(log2(amax)) - 8 + 127 gives d = 2^(floor(log2(amax))-8), so
         // the largest E4M3 value (448) covers amax up to 1.75 * 2^floor.
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 8 + 128) : 0;
-        const float d = GGML_E8M0_TO_FP32_HALF(e);
+        // Standard E8M0 (bias 127) so the Blackwell mxf8f6f4 MMA applies the
+        // hardware ue8m0 scale directly and the CUDA dequant matches the CPU.
+        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 8 + 127) : 0;
+        const float d = GGML_E8M0_TO_FP32(e);
         y[i].e = e;
 
         for (int j = 0; j < qk; j++) {
@@ -668,7 +670,7 @@ void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
+        const float d = GGML_E8M0_TO_FP32(x[i].e);
 
         for (int j = 0; j < qk; j++) {
             const uint8_t idx = x[i].qs[j];

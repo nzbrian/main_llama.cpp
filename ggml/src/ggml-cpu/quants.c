@@ -346,7 +346,7 @@ void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     float sumf = 0;
     for (int ib = 0; ib < nb; ++ib) {
-        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32_HALF(x[ib].e);
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32(x[ib].e);
 
         float sum = 0;
         for (int j = 0; j < QK_MXFP8; ++j) {
