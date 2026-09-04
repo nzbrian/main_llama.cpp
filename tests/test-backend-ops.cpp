@@ -4581,9 +4581,12 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // for blackwell we quantize activations to mxfp4/mxfp8 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP8")) {
+            return 1e-2; // E4M3 activation re-quantization floor measured ~2.5e-3
         }
         return max_nmse_err();
     }
@@ -4782,9 +4785,12 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // for blackwell we quantize activations to mxfp4/mxfp8 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP8")) {
+            return 1e-2; // E4M3 activation re-quantization floor measured ~2.5e-3
         }
         return max_nmse_err();
     }
