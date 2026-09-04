@@ -9453,6 +9453,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // MXFP8 (Blackwell mxf8f6f4 MMQ fast path): several batch sizes to cover MMVF + MMQ + operand-swap
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 1,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 8,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 16, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 128, 5120, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
