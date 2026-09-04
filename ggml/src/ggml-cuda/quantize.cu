@@ -525,7 +525,7 @@ static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
         const uint8_t e   = compute_e8m0_scale_mxfp8(amax);
         const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
         scales[b]         = e;
-        codes[b][lane_id] = ggml_cuda_fp32_to_ue4m3(xi * inv_s);
+        codes[b][lane_id] = ggml_cuda_fp32_to_e4m3(xi * inv_s);
 #else
         (void) xi;
         scales[b]         = 0;

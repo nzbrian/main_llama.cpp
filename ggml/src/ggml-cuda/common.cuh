@@ -879,6 +879,19 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+// Signed E4M3 (E4M3FN, max 448) encode for activations on the MXFP8 mxf8f6f4 MMQ path.
+// Unlike ggml_cuda_fp32_to_ue4m3 (unsigned, for NVFP4 scales) this preserves the sign,
+// so negative activation values are encoded rather than zeroed. The bit layout matches
+// the CPU kvalues_mxfp8 LUT exactly: bit 7 = sign, bits [6:3] = exp (bias 7), [2:0] = man.
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const __nv_fp8_e4m3 xf(x);
+    return xf.__x;
+#else
+     NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
