@@ -397,6 +397,72 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
+static void quantize_row_mxfp4_w(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    // imatrix-aware MXFP4. w is the per-column importance vector (length k), the same
+    // for every row (matches the K-quant imatrix convention). For a fixed discrete E8M0
+    // scale, weighted per-value rounding == unweighted nearest (the weight is constant
+    // across the 16 level candidates), so the only imatrix lever is choosing the E8M0
+    // exponent that minimizes the importance-weighted block reconstruction error.
+    static const int qk = QK_MXFP4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+
+        if (amax <= 0.0f) {
+            y[i].e = 0;
+            for (int j = 0; j < qk/2; ++j) {
+                y[i].qs[j] = 0;
+            }
+            continue;
+        }
+
+        const int e0 = (int) (floorf(log2f(amax)) - 2 + 127);
+
+        float best_mse = 1e30f;
+        int   best_e   = e0;
+        for (int e = e0 - 4; e <= e0 + 1; e++) {
+            if (e <= 0 || e >= 255) {
+                continue;
+            }
+            const float d = GGML_E8M0_TO_FP32_HALF((uint8_t) e);
+            float mse = 0.0f;
+            for (int j = 0; j < qk; j++) {
+                const int   idx  = best_index_mxfp4(x[i*qk + j], d);
+                const float diff = x[i*qk + j] - (float) kvalues_mxfp4[idx] * d;
+                mse += w[i*qk + j] * diff * diff;
+            }
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_e   = e;
+            }
+        }
+
+        const float d = GGML_E8M0_TO_FP32_HALF((uint8_t) best_e);
+
+        y[i].e = (uint8_t) best_e;
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
+            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
+
+            y[i].qs[j]  = x0;
+            y[i].qs[j] |= x1 << 4;
+        }
+    }
+}
+
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -457,6 +523,72 @@ void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RE
         const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 8 + 127) : 0;
         const float d = GGML_E8M0_TO_FP32(e);
         y[i].e = e;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            uint8_t idx = (uint8_t) best_index_mxfp8(fabsf(v), d);
+            if (v < 0.0f) idx |= 0x80; // sign bit
+            y[i].qs[j] = idx;
+        }
+    }
+}
+
+static void quantize_row_mxfp8_w(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    // imatrix-aware MXFP8. w is the per-column importance vector (length k), the same
+    // for every row (matches the K-quant imatrix convention). For a fixed discrete E8M0
+    // scale, weighted per-value rounding == unweighted nearest (the weight is constant
+    // across the 128 level candidates), so the only imatrix lever is choosing the E8M0
+    // exponent that minimizes the importance-weighted block reconstruction error.
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+
+        if (amax <= 0.0f) {
+            y[i].e = 0;
+            for (int j = 0; j < qk; ++j) {
+                y[i].qs[j] = 0;
+            }
+            continue;
+        }
+
+        const int e0 = (int) (floorf(log2f(amax)) - 8 + 127);
+
+        float best_mse = 1e30f;
+        int   best_e   = e0;
+        for (int e = e0 - 4; e <= e0 + 1; e++) {
+            if (e <= 0 || e >= 255) {
+                continue;
+            }
+            const float d = GGML_E8M0_TO_FP32((uint8_t) e);
+            float mse = 0.0f;
+            for (int j = 0; j < qk; j++) {
+                const float v = x[i*qk + j];
+                uint8_t idx   = (uint8_t) best_index_mxfp8(fabsf(v), d);
+                const float q = kvalues_mxfp8[idx & 0x7F] * (v < 0.0f ? -d : d);
+                const float diff = v - q;
+                mse += w[i*qk + j] * diff * diff;
+            }
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_e   = e;
+            }
+        }
+
+        const float d = GGML_E8M0_TO_FP32((uint8_t) best_e);
+
+        y[i].e = (uint8_t) best_e;
 
         for (int j = 0; j < qk; j++) {
             const float v = x[i*qk + j];
@@ -2369,9 +2501,17 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 }
 
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
-    quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
-    return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    if (!quant_weights) {
+        quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    } else {
+        char * qrow = (char *) dst;
+        for (int64_t row = 0; row < nrow; row++) {
+            quantize_row_mxfp4_w(src + row*n_per_row, quant_weights, (block_mxfp4 *) qrow, n_per_row);
+            qrow += row_size;
+        }
+    }
+    return nrow * row_size;
 }
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -2381,9 +2521,17 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 }
 
 size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
-    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
-    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+    if (!quant_weights) {
+        quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    } else {
+        char * qrow = (char *) dst;
+        for (int64_t row = 0; row < nrow; row++) {
+            quantize_row_mxfp8_w(src + row*n_per_row, quant_weights, (block_mxfp8 *) qrow, n_per_row);
+            qrow += row_size;
+        }
+    }
+    return nrow * row_size;
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
