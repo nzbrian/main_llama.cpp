@@ -1,9 +1,243 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmq-profile.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+// ---------------------------------------------------------------------------
+// MMQ profiler: device globals + host implementation (see mmq-profile.cuh).
+// All of this is inert unless GGML_MQ_PROFILE is set.
+// ---------------------------------------------------------------------------
+struct mq_host_state {
+    bool initialized   = false;
+    bool enabled       = false;
+
+    // event ring: 2 events per slot (start, end)
+    cudaEvent_t ev[2 * mmq_profile::RING_SLOTS];
+    int8_t      kind[mmq_profile::RING_SLOTS];
+    int8_t      bucket[mmq_profile::RING_SLOTS];
+    mmq_profile::device_counters * d_counters = nullptr; // in-kernel phase counters (device mem)
+    int         ring_count     = 0; // slots written in the current capture/direct call
+    int         graph_brackets = 0; // bracket slots belonging to the current graph
+    int         prev_active    = 0; // bracket slots to flush for the previous call
+    bool        ring_overflow  = false;
+
+    // graph boundary events (ping-pong across calls)
+    cudaEvent_t graph_start = nullptr;
+    cudaEvent_t graph_end   = nullptr;
+    bool        prev_pending = false;
+
+    // accumulators (host)
+    double  ms[mmq_profile::NUM_KINDS][mmq_profile::NUM_BUCKETS] = {};
+    double  graph_ms_total = 0.0;
+    double  dev_cycles[mmq_profile::NUM_PHASES][mmq_profile::NUM_BUCKETS] = {};
+    unsigned long long dev_tiles[mmq_profile::NUM_BUCKETS] = {};
+    unsigned long long n_graphs = 0;
+    unsigned long long n_kernels[mmq_profile::NUM_KINDS] = {};
+    int     sm_clock_khz = 0;
+    bool    printed_final = false;
+
+    mq_host_state() { for (int i = 0; i < 2 * mmq_profile::RING_SLOTS; i++) { ev[i] = nullptr; } }
+};
+
+// File-local helpers (static; forward-declared to satisfy -Wmissing-declarations).
+// A named/anonymous namespace is avoided: GCC emits a spurious -Wextra-semi at a
+// bogus column for anonymous namespaces.
+static mq_host_state & mq_state();
+static const char * mq_bucket_label(int b);
+static void mq_print_summary(const char * tag);
+static void mq_flush_last();
+static void mq_atexit();
+
+static mq_host_state & mq_state() {
+    static mq_host_state s;
+    return s;
+}
+
+static const char * mq_bucket_label(int b) {
+    switch (b) {
+        case 0:  return "ne11=1";
+        case 1:  return "ne11=2..64";
+        case 2:  return "ne11=65..256";
+        case 3:  return "ne11=257..1024";
+        default: return "ne11>1024";
+    }
+}
+
+static void mq_print_summary(const char * tag) {
+    mq_host_state & s = mq_state();
+    const double in_mmq = [&] {
+        double t = 0.0;
+        for (int k = 0; k < mmq_profile::NUM_KINDS; k++)
+            for (int b = 0; b < mmq_profile::NUM_BUCKETS; b++) t += s.ms[k][b];
+        return t;
+    }();
+    const double outside = s.graph_ms_total - in_mmq;
+
+    fprintf(stderr, "\n=================== MMQ PROFILE [%s] ===================\n", tag);
+    fprintf(stderr, "graphs: %llu   sm_clock: %d MHz   (device phases are MXFP8-only)\n",
+            (unsigned long long) s.n_graphs, s.sm_clock_khz / 1000);
+    fprintf(stderr, "graph wall (total)            : %10.2f ms\n", s.graph_ms_total);
+    fprintf(stderr, "  in MMQ path (before+during+after): %10.2f ms  (%.1f%%)\n",
+            in_mmq, s.graph_ms_total > 0.0 ? 100.0 * in_mmq / s.graph_ms_total : 0.0);
+    fprintf(stderr, "  OUTSIDE MMQ (attention/GDN/norms/...): %10.2f ms  (%.1f%%)\n",
+            outside, s.graph_ms_total > 0.0 ? 100.0 * (outside > 0.0 ? outside : 0.0) / s.graph_ms_total : 0.0);
+    if (s.ring_overflow) {
+        fprintf(stderr, "  WARNING: event ring overflowed; some kernels were not timed.\n");
+    }
+    fprintf(stderr, "\n  %-14s | %10s %10s %10s | %9s %9s %9s | %7s %7s %7s %7s\n",
+            "bucket", "BQUANT", "MMQ", "FIXUP", "before%", "during%", "after%", "LOAD%", "MMA%", "EPI%", "BOOK%");
+    fprintf(stderr, "  %-14s-+-%10s-%10s-%10s-+-%9s-%9s-%9s-+-%7s-%7s-%7s-%7s\n",
+            "--------------", "----------", "----------", "----------", "---------", "---------", "---------",
+            "-------", "-------", "-------", "-------");
+    for (int b = 0; b < mmq_profile::NUM_BUCKETS; b++) {
+        const double bq = s.ms[mmq_profile::KIND_BQUANT][b];
+        const double mm = s.ms[mmq_profile::KIND_MMQ][b];
+        const double fx = s.ms[mmq_profile::KIND_FIXUP][b];
+        const double tot = bq + mm + fx;
+        auto pct = [](double x, double d) { return d > 0.0 ? 100.0 * x / d : 0.0; };
+        // device phase % within the MMQ kernel for this bucket
+        double dl = s.dev_cycles[mmq_profile::PHASE_LOAD][b];
+        double dm = s.dev_cycles[mmq_profile::PHASE_MMA ][b];
+        double de = s.dev_cycles[mmq_profile::PHASE_EPI ][b];
+        double db = s.dev_cycles[mmq_profile::PHASE_BOOK][b];
+        const double dtot = dl + dm + de + db;
+        fprintf(stderr, "  %-14s | %10.2f %10.2f %10.2f | %8.1f%% %8.1f%% %8.1f%% | %6.1f%% %6.1f%% %6.1f%% %6.1f%%\n",
+                mq_bucket_label(b), bq, mm, fx,
+                pct(bq, tot), pct(mm, tot), pct(fx, tot),
+                pct(dl, dtot), pct(dm, dtot), pct(de, dtot), pct(db, dtot));
+    }
+    fprintf(stderr, "  (BQUANT/MMQ/FIXUP = host wall ms; before/during/after = share of that bucket's MMQ path;\n"
+                    "   LOAD/MMA/EPI/BOOK = share of in-kernel SM time, MXFP8 only)\n");
+    fprintf(stderr, "=================================================================\n\n");
+    fflush(stderr);
+}
+
+// Sync the last in-flight graph and fold its timings into the host
+// accumulators. Makes CUDA calls; must run while the context is alive.
+static void mq_flush_last() {
+    mq_host_state & s = mq_state();
+    if (!s.enabled || !s.prev_pending) { return; }
+    CUDA_CHECK(cudaEventSynchronize(s.graph_end));
+    float gms = 0.0f;
+    if (cudaEventElapsedTime(&gms, s.graph_start, s.graph_end) == cudaSuccess) {
+        s.graph_ms_total += gms;
+    }
+    for (int i = 0; i < s.prev_active; i++) {
+        float kms = 0.0f;
+        if (cudaEventElapsedTime(&kms, s.ev[2 * i], s.ev[2 * i + 1]) == cudaSuccess) {
+            s.ms[s.kind[i]][s.bucket[i]] += kms;
+            s.n_kernels[s.kind[i]]++;
+        }
+    }
+    mmq_profile::device_counters dc;
+    CUDA_CHECK(cudaMemcpy(&dc, s.d_counters, sizeof(mmq_profile::device_counters), cudaMemcpyDeviceToHost));
+    for (int p = 0; p < mmq_profile::NUM_PHASES; p++) {
+        for (int b = 0; b < mmq_profile::NUM_BUCKETS; b++) {
+            s.dev_cycles[p][b] += (double) dc.cycles[p][b];
+        }
+    }
+    for (int b = 0; b < mmq_profile::NUM_BUCKETS; b++) {
+        s.dev_tiles[b] += dc.tiles[b];
+    }
+    CUDA_CHECK(cudaMemset(s.d_counters, 0, sizeof(mmq_profile::device_counters)));
+    s.prev_pending = false;
+}
+
+// atexit fallback: print-only, since the CUDA context may already be gone.
+static void mq_atexit() {
+    mq_host_state & s = mq_state();
+    if (s.enabled && !s.printed_final) {
+        mq_print_summary("final (atexit; last graph may be unflushed)");
+        s.printed_final = true;
+    }
+}
+
+bool mmq_profile::enabled() {
+    mq_host_state & s = mq_state();
+    if (!s.initialized) {
+        const char * env = std::getenv("GGML_MQ_PROFILE");
+        s.enabled = env != nullptr && std::atoi(env) != 0;
+        if (s.enabled) {
+            for (int i = 0; i < 2 * mmq_profile::RING_SLOTS; i++) {
+                CUDA_CHECK(cudaEventCreate(&s.ev[i]));
+            }
+            CUDA_CHECK(cudaEventCreate(&s.graph_start));
+            CUDA_CHECK(cudaEventCreate(&s.graph_end));
+            CUDA_CHECK(cudaMalloc(&s.d_counters, sizeof(mmq_profile::device_counters)));
+            CUDA_CHECK(cudaMemset(s.d_counters, 0, sizeof(mmq_profile::device_counters)));
+            int khz = 0;
+            cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0);
+            s.sm_clock_khz = khz;
+            std::atexit(mq_atexit);
+            fprintf(stderr, "[mmq-profile] enabled (ring=%d slots, sm_clock=%d kHz)\n",
+                    mmq_profile::RING_SLOTS, khz);
+        }
+        s.initialized = true;
+    }
+    return s.enabled;
+}
+
+mmq_profile::device_counters * mmq_profile::prof_buffer() {
+    return mq_state().d_counters;
+}
+
+void mmq_profile::on_kernel_begin(int kind_idx, int bucket, cudaStream_t stream) {
+    if (!enabled()) { return; }
+    mq_host_state & s = mq_state();
+    if (s.ring_count >= mmq_profile::RING_SLOTS) { s.ring_overflow = true; return; }
+    const int slot = s.ring_count;
+    s.kind[slot]   = (int8_t) kind_idx;
+    s.bucket[slot] = (int8_t) bucket;
+    CUDA_CHECK(cudaEventRecord(s.ev[2 * slot], stream));
+}
+
+void mmq_profile::on_kernel_end(cudaStream_t stream) {
+    if (!enabled()) { return; }
+    mq_host_state & s = mq_state();
+    if (s.ring_count >= mmq_profile::RING_SLOTS) { s.ring_overflow = true; return; }
+    const int slot = s.ring_count;
+    CUDA_CHECK(cudaEventRecord(s.ev[2 * slot + 1], stream));
+    s.ring_count = slot + 1;
+}
+
+void mmq_profile::graph_begin(cudaStream_t stream) {
+    if (!enabled()) { return; }
+    mq_host_state & s = mq_state();
+    // Flush the previous graph's timings (syncs its completion event).
+    mq_flush_last();
+    s.ring_count = 0;
+    CUDA_CHECK(cudaEventRecord(s.graph_start, stream));
+}
+
+void mmq_profile::graph_end(cudaStream_t stream) {
+    if (!enabled()) { return; }
+    mq_host_state & s = mq_state();
+    if (s.ring_count > 0) {
+        s.graph_brackets = s.ring_count; // this call (re)captured / directly ran brackets
+    }
+    s.prev_active = s.graph_brackets;
+    CUDA_CHECK(cudaEventRecord(s.graph_end, stream));
+    s.prev_pending = true;
+    s.n_graphs++;
+    if (s.n_graphs % mmq_profile::PRINT_EVERY_GRAPHS == 0) {
+        mq_print_summary("periodic");
+    }
+}
+
+void mmq_profile::shutdown() {
+    mq_host_state & s = mq_state();
+    if (!s.enabled) { return; }
+    mq_flush_last();
+    if (!s.printed_final) {
+        mq_print_summary("final");
+        s.printed_final = true;
+    }
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -150,6 +384,8 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
+            const int prof_bucket = mmq_profile::bucket_of((int) ne11);
+            mmq_profile::on_kernel_begin(mmq_profile::KIND_BQUANT, prof_bucket, stream);
             if (use_native_fp) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
@@ -162,6 +398,7 @@ void ggml_cuda_mul_mat_q(
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+            mmq_profile::on_kernel_end(stream);
         }
 
         // Stride depends on quantization format
@@ -223,7 +460,8 @@ void ggml_cuda_mul_mat_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-
+        const int prof_bucket = mmq_profile::bucket_of((int) ne_get_rows);
+        mmq_profile::on_kernel_begin(mmq_profile::KIND_BQUANT, prof_bucket, stream);
         if (use_native_fp) {
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
@@ -242,6 +480,7 @@ void ggml_cuda_mul_mat_q(
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
+        mmq_profile::on_kernel_end(stream);
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");

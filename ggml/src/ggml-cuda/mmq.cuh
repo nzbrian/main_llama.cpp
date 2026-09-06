@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "mmq-profile.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -879,7 +880,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        mmq_profile::device_counters * prof) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -907,7 +909,21 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    // MMQ profiler: in-kernel phase timing. Compile-time erased for every type
+    // except MXFP8; at runtime a no-op (one cached global load + a not-taken
+    // branch) unless GGML_MQ_PROFILE=1. Only the representative thread of the
+    // block reads the clock, so there is no cross-thread contention. The clock
+    // is sampled around the __syncthreads() barriers, so each phase also
+    // includes the barrier wait (i.e. the slowest thread in the block).
+    constexpr bool is_prof_type = (type == GGML_TYPE_MXFP8);
+    const bool prof_rep = is_prof_type
+        ? (prof != nullptr && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+        : false;
+    unsigned long long c_load = 0, c_mma = 0, c_prev = 0, c_start = 0;
+    if (prof_rep) { c_start = c_prev = clock64(); }
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        if (prof_rep) { c_prev = clock64(); }
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
@@ -921,9 +937,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+        if (prof_rep) { c_load += clock64() - c_prev; c_prev = clock64(); }
+
         vec_dot(tile_x, tile_y, sum, 0);
 
         __syncthreads();
+
+        if (prof_rep) { c_mma += clock64() - c_prev; c_prev = clock64(); }
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
@@ -937,15 +957,33 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+        if (prof_rep) { c_load += clock64() - c_prev; c_prev = clock64(); }
+
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+
+        if (prof_rep) { c_mma += clock64() - c_prev; c_prev = clock64(); }
     }
+
+    if (prof_rep) { c_prev = clock64(); }
 
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
     } else {
         write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
+
+    if (prof_rep) {
+        const unsigned long long c_epi   = clock64() - c_prev;
+        const unsigned long long c_total = clock64() - c_start;
+        const unsigned long long c_book  = c_total - c_load - c_mma - c_epi;
+        const int b = mmq_profile::bucket_of(ncols_y);
+        atomicAdd(&prof->cycles[mmq_profile::PHASE_LOAD][b], c_load);
+        atomicAdd(&prof->cycles[mmq_profile::PHASE_MMA ][b], c_mma);
+        atomicAdd(&prof->cycles[mmq_profile::PHASE_EPI ][b], c_epi);
+        atomicAdd(&prof->cycles[mmq_profile::PHASE_BOOK][b], c_book);
+        atomicAdd(&prof->tiles[b], 1);
     }
 }
 
@@ -961,7 +999,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, mmq_profile::device_counters * prof) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1058,7 +1096,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, prof);
         return;
     }
 
@@ -1152,7 +1190,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, prof);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1236,7 +1274,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, prof);
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1427,13 +1465,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    const int prof_bucket = mmq_profile::bucket_of((int) args.ncols_y);
+    mmq_profile::device_counters * prof_buf = mmq_profile::prof_buffer();
+
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+        mmq_profile::on_kernel_begin(mmq_profile::KIND_MMQ, prof_bucket, stream);
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, prof_buf);
+        mmq_profile::on_kernel_end(stream);
         return;
     }
 
@@ -1457,22 +1500,26 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
+    mmq_profile::on_kernel_begin(mmq_profile::KIND_MMQ, prof_bucket, stream);
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, prof_buf);
+    mmq_profile::on_kernel_end(stream);
 
     if (!fixup_needed) {
         return;
     }
 
     CUDA_CHECK(cudaGetLastError());
+    mmq_profile::on_kernel_begin(mmq_profile::KIND_FIXUP, prof_bucket, stream);
     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
+    mmq_profile::on_kernel_end(stream);
 }
 
 template <ggml_type type, bool fallback>
