@@ -1,6 +1,17 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
+// Vendor-abstracted runtime include, mirroring common.cuh. In practice this
+// header is always included after common.cuh (which already pulls in the
+// vendor runtime via #pragma once), so this is a no-op there; it keeps the
+// header self-contained and correct under the HIP and MUSA backends, where a
+// bare <cuda_runtime_api.h> does not exist.
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#elif defined(GGML_USE_MUSA)
+#include "vendors/musa.h"
+#else
+#include "vendors/cuda.h"
+#endif
 
 #include <cstddef>
 #include <cstdint>
