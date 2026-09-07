@@ -22,7 +22,7 @@
 //
 // Breaks down where time is spent in and around the mixed-quantization (MMQ)
 // matmul kernels, i.e. in the code before / during / after the Blackwell
-// MXFP8 / MXFP4 tensor-core fast path. Everything is a no-op (single cached
+// FP4 (NVFP4 / MXFP4) tensor-core fast path. Everything is a no-op (single cached
 // branch) when GGML_MQ_PROFILE is not set, so it is safe to leave compiled in.
 //
 // Host side (CUDA event ring, real GPU wall-time in ms, valid under CUDA graph
@@ -35,7 +35,7 @@
 //            layernorm, elementwise, ...).  = graph_ms - (BQUANT+MMQ+FIXUP)
 //
 // Device side (clock64() phase counters inside mul_mat_q_process_tile, erased
-// at compile time for every type except MXFP8 via `if constexpr`):
+// at compile time for every type except the FP4 path (NVFP4 / MXFP4) via `if constexpr`):
 //
 //   LOAD   A/B tile loads + __syncthreads barriers
 //   MMA    the vec_dot (tensor-core) calls
@@ -59,12 +59,12 @@ namespace mmq_profile {
 constexpr int NUM_BUCKETS = 5;
 constexpr int NUM_KINDS   = 3; // BQUANT, MMQ, FIXUP
 constexpr int NUM_PHASES  = 4; // LOAD, MMA, EPI, BOOK
-// Event ring size (2 * RING_SLOTS events). A ring is (re)allocated for every
-// call that re-records events (direct execution or graph capture), because a
-// captured event may only belong to ONE graph and must not be reused in another
-// capture. 512 slots covers the per-graph MMQ kernel count of any realistic
-// model (a 27B layer count x ~3 MMQ kernels per matmul stays well under this).
-constexpr int RING_SLOTS  = 512;
+// Event ring size (2 * RING_SLOTS events) for the single reusable direct ring.
+// A full-model ubatch graph runs every layer's matmuls, each emitting BQUANT +
+// MMQ (+ FIXUP when stream_k): a 36-layer MoE/GDN model is ~700+ such kernels
+// per graph, so 4096 slots leaves headroom for models up to ~150 layers. The
+// ring is allocated once, so a larger size has only a one-time cost.
+constexpr int RING_SLOTS  = 4096;
 constexpr int PRINT_EVERY_GRAPHS = 1024;
 
 enum kind : int {

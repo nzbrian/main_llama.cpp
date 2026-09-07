@@ -4681,12 +4681,9 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4/mxfp8 instead of q8_1 so we add higher tolerance
+        // for blackwell we quantize activations to fp4 (mxfp4/nvfp4) instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
-        }
-        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP8")) {
-            return 1e-2; // E4M3 activation re-quantization floor measured ~2.5e-3
         }
         return max_nmse_err();
     }
@@ -4968,12 +4965,9 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4/mxfp8 instead of q8_1 so we add higher tolerance
+        // for blackwell we quantize activations to fp4 (mxfp4/nvfp4) instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
-        }
-        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP8")) {
-            return 1e-2; // E4M3 activation re-quantization floor measured ~2.5e-3
         }
         return max_nmse_err();
     }
@@ -9677,12 +9671,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
-    // MXFP8 (Blackwell mxf8f6f4 MMQ fast path): several batch sizes to cover MMVF + MMQ + operand-swap
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 1,  5120, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 8,  5120, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 16, 5120, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 1024, 128, 5120, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {

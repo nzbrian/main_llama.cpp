@@ -334,22 +334,6 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
-static inline int best_index_mxfp8(float x, float e) {
-    // x: magnitude (non-negative); e: block scale.  Find the E4M3 magnitude
-    // (kvalues_mxfp8, 128 non-negative values) whose product with e is closest
-    // to x.  The sign is stored separately in the high bit of the qs byte.
-    int best_index = 0;
-    float best_err = fabsf(kvalues_mxfp8[0]*e - x);
-    for (int i = 1; i < 128; i++) {
-        float err = fabsf(kvalues_mxfp8[i]*e - x);
-        if (err < best_err) {
-            best_index = i;
-            best_err = err;
-        }
-    }
-    return best_index;
-}
-
 static inline int best_index_mxfp4(float x, float e) {
     int best_index = 0;
     float best_err = fabsf(kvalues_mxfp4[0]*e - x);
@@ -494,107 +478,6 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
 
                 y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
             }
-        }
-    }
-}
-
-void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK_MXFP8;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-            }
-        }
-
-        // E8M0 scale: with GGML_E8M0_TO_FP32(e) = 2^(e-127), choosing
-        // e = floor(log2(amax)) - 8 + 127 gives d = 2^(floor(log2(amax))-8), so
-        // the largest E4M3 value (448) covers amax up to 1.75 * 2^floor.
-        // Standard E8M0 (bias 127) so the Blackwell mxf8f6f4 MMA applies the
-        // hardware ue8m0 scale directly and the CUDA dequant matches the CPU.
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 8 + 127) : 0;
-        const float d = GGML_E8M0_TO_FP32(e);
-        y[i].e = e;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            uint8_t idx = (uint8_t) best_index_mxfp8(fabsf(v), d);
-            if (v < 0.0f) idx |= 0x80; // sign bit
-            y[i].qs[j] = idx;
-        }
-    }
-}
-
-static void quantize_row_mxfp8_w(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
-    // imatrix-aware MXFP8. w is the per-column importance vector (length k), the same
-    // for every row (matches the K-quant imatrix convention). For a fixed discrete E8M0
-    // scale, weighted per-value rounding == unweighted nearest (the weight is constant
-    // across the 128 level candidates), so the only imatrix lever is choosing the E8M0
-    // exponent that minimizes the importance-weighted block reconstruction error.
-    static const int qk = QK_MXFP8;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-            }
-        }
-
-        if (amax <= 0.0f) {
-            y[i].e = 0;
-            for (int j = 0; j < qk; ++j) {
-                y[i].qs[j] = 0;
-            }
-            continue;
-        }
-
-        const int e0 = (int) (floorf(log2f(amax)) - 8 + 127);
-
-        float best_mse = 1e30f;
-        int   best_e   = e0;
-        for (int e = e0 - 4; e <= e0 + 1; e++) {
-            if (e <= 0 || e >= 255) {
-                continue;
-            }
-            const float d = GGML_E8M0_TO_FP32((uint8_t) e);
-            float mse = 0.0f;
-            for (int j = 0; j < qk; j++) {
-                const float v = x[i*qk + j];
-                uint8_t idx   = (uint8_t) best_index_mxfp8(fabsf(v), d);
-                const float q = kvalues_mxfp8[idx & 0x7F] * (v < 0.0f ? -d : d);
-                const float diff = v - q;
-                mse += w[i*qk + j] * diff * diff;
-            }
-            if (mse < best_mse) {
-                best_mse = mse;
-                best_e   = e;
-            }
-        }
-
-        const float d = GGML_E8M0_TO_FP32((uint8_t) best_e);
-
-        y[i].e = (uint8_t) best_e;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            uint8_t idx = (uint8_t) best_index_mxfp8(fabsf(v), d);
-            if (v < 0.0f) idx |= 0x80; // sign bit
-            y[i].qs[j] = idx;
         }
     }
 }
@@ -790,24 +673,6 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + 0       ] = v0*d;
                 yb[j + qk_sub/2] = v1*d;
             }
-        }
-    }
-}
-
-void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK_MXFP8;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32(x[i].e);
-
-        for (int j = 0; j < qk; j++) {
-            const uint8_t idx = x[i].qs[j];
-            const float v = kvalues_mxfp8[idx & 0x7F];
-            y[i*qk + j] = (idx & 0x80) ? -v*d : v*d;
         }
     }
 }
@@ -2518,20 +2383,6 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
-}
-
-size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    const size_t row_size = ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
-    if (!quant_weights) {
-        quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
-    } else {
-        char * qrow = (char *) dst;
-        for (int64_t row = 0; row < nrow; row++) {
-            quantize_row_mxfp8_w(src + row*n_per_row, quant_weights, (block_mxfp8 *) qrow, n_per_row);
-            qrow += row_size;
-        }
-    }
-    return nrow * row_size;
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5789,10 +5640,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
-            } break;
-        case GGML_TYPE_MXFP8:
-            {
-                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
             } break;
         case GGML_TYPE_Q2_K:
             {

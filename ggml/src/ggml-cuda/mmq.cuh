@@ -76,8 +76,6 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
-        case GGML_TYPE_MXFP8:
-            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q2_K:
             return MMQ_Q8_1_DS_LAYOUT_D2S6;
         case GGML_TYPE_Q3_K:
@@ -698,12 +696,6 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_nvfp4_nvfp4<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
-        case GGML_TYPE_MXFP8:
-            return ggml_cuda_mmq_util_funcs(
-                -1,
-                ggml_cuda_mmq_load_tiles_mxfp8_fp8<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_fp8_fp8_mma<type, J, fallback>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         default:
             break;
     }
@@ -910,12 +902,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     // MMQ profiler: in-kernel phase timing. Compile-time erased for every type
-    // except MXFP8; at runtime a no-op (one cached global load + a not-taken
-    // branch) unless GGML_MQ_PROFILE=1. Only the representative thread of the
-    // block reads the clock, so there is no cross-thread contention. The clock
-    // is sampled around the __syncthreads() barriers, so each phase also
-    // includes the barrier wait (i.e. the slowest thread in the block).
-    constexpr bool is_prof_type = (type == GGML_TYPE_MXFP8);
+    // except the FP4 block-scale path (NVFP4 / MXFP4); at runtime a no-op (one
+    // cached global load + a not-taken branch) unless GGML_MQ_PROFILE=1. Only the
+    // representative thread of the block reads the clock, so there is no
+    // cross-thread contention. The clock is sampled around the __syncthreads()
+    // barriers, so each phase also includes the barrier wait (i.e. the slowest
+    // thread in the block).
+    constexpr bool is_prof_type = (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4);
     const bool prof_rep = is_prof_type
         ? (prof != nullptr && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
         : false;

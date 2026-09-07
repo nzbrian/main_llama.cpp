@@ -12,11 +12,11 @@
 // MMQ profiler: host implementation (see mmq-profile.cuh).
 // Inert unless GGML_MQ_PROFILE is set.
 //
-// The profiler targets the Blackwell CUDA MXFP8 MMQ path and is compiled out
-// to no-op stubs under HIP/MUSA: those backends never run that path, and the
-// ROCm/MUSA runtime does not expose the cuda* event API the host code below
-// uses. The device-side phase counters in mmq.cuh stay portable (they are a
-// no-op whenever prof_buffer() returns nullptr, which the stubs do).
+// The profiler targets the Blackwell CUDA FP4 (NVFP4 / MXFP4) MMQ path and is
+// compiled out to no-op stubs under HIP/MUSA: those backends never run that
+// path, and the ROCm/MUSA runtime does not expose the cuda* event API the host
+// code below uses. The device-side phase counters in mmq.cuh stay portable
+// (they are a no-op whenever prof_buffer() returns nullptr, which the stubs do).
 // ---------------------------------------------------------------------------
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -111,7 +111,7 @@ static void mq_print_summary(const char * tag) {
     const double outside = s.graph_ms_total - in_mmq;
 
     fprintf(stderr, "\n=================== MMQ PROFILE [%s] ===================\n", tag);
-    fprintf(stderr, "graphs: %llu   sm_clock: %d MHz   (device phases are MXFP8-only)\n",
+    fprintf(stderr, "graphs: %llu   sm_clock: %d MHz   (device phases are FP4-only)\n",
             (unsigned long long) s.n_graphs, s.sm_clock_khz / 1000);
     fprintf(stderr, "graph wall (total)            : %10.2f ms\n", s.graph_ms_total);
     fprintf(stderr, "  in MMQ path (before+during+after): %10.2f ms  (%.1f%%)\n",
@@ -149,7 +149,7 @@ static void mq_print_summary(const char * tag) {
                 pct(dl, dtot), pct(dm, dtot), pct(de, dtot), pct(db, dtot));
     }
     fprintf(stderr, "  (BQUANT/MMQ/FIXUP = host wall ms; before/during/after = share of that bucket's MMQ path;\n"
-                    "   LOAD/MMA/EPI/BOOK = share of in-kernel SM time, MXFP8 only)\n");
+                    "   LOAD/MMA/EPI/BOOK = share of in-kernel SM time, FP4 only)\n");
     fprintf(stderr, "=================================================================\n\n");
     fflush(stderr);
 }
@@ -396,9 +396,6 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
-        case GGML_TYPE_MXFP8:
-            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
-            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -452,8 +449,7 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
-    const bool use_native_fp8 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP8);
-    const bool use_native_fp  = use_native_fp4 || use_native_fp8;
+    const bool use_native_fp  = use_native_fp4;
     const size_t y_block_size       = use_native_fp  ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -620,11 +616,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
-            break;
-        case GGML_TYPE_MXFP8:
-            // The FP8 block-scaled tensor-core MMQ path (mxf8f6f4) exists only on Blackwell;
-            // on other archs there is no dequant-dp4a kernel, so fall back to cuBLAS (dequant).
-            mmq_supported = cc >= GGML_CUDA_CC_BLACKWELL;
             break;
         default:
             mmq_supported = false;
