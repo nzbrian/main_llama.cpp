@@ -9,9 +9,17 @@
 #include <cstdlib>
 
 // ---------------------------------------------------------------------------
-// MMQ profiler: device globals + host implementation (see mmq-profile.cuh).
-// All of this is inert unless GGML_MQ_PROFILE is set.
+// MMQ profiler: host implementation (see mmq-profile.cuh).
+// Inert unless GGML_MQ_PROFILE is set.
+//
+// The profiler targets the Blackwell CUDA MXFP8 MMQ path and is compiled out
+// to no-op stubs under HIP/MUSA: those backends never run that path, and the
+// ROCm/MUSA runtime does not expose the cuda* event API the host code below
+// uses. The device-side phase counters in mmq.cuh stay portable (they are a
+// no-op whenever prof_buffer() returns nullptr, which the stubs do).
 // ---------------------------------------------------------------------------
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 struct mq_host_state {
     bool initialized   = false;
     bool enabled       = false;
@@ -238,6 +246,18 @@ void mmq_profile::shutdown() {
         s.printed_final = true;
     }
 }
+
+#else  // GGML_USE_HIP || GGML_USE_MUSA : no-op profiler (never runs the CUDA path)
+
+bool mmq_profile::enabled() { return false; }
+mmq_profile::device_counters * mmq_profile::prof_buffer() { return nullptr; }
+void mmq_profile::on_kernel_begin(int, int, cudaStream_t) {}
+void mmq_profile::on_kernel_end(cudaStream_t) {}
+void mmq_profile::graph_begin(cudaStream_t) {}
+void mmq_profile::graph_end(cudaStream_t) {}
+void mmq_profile::shutdown() {}
+
+#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
