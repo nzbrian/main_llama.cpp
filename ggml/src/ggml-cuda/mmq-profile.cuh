@@ -59,7 +59,12 @@ namespace mmq_profile {
 constexpr int NUM_BUCKETS = 5;
 constexpr int NUM_KINDS   = 3; // BQUANT, MMQ, FIXUP
 constexpr int NUM_PHASES  = 4; // LOAD, MMA, EPI, BOOK
-constexpr int RING_SLOTS  = 4096;
+// Event ring size (2 * RING_SLOTS events). A ring is (re)allocated for every
+// call that re-records events (direct execution or graph capture), because a
+// captured event may only belong to ONE graph and must not be reused in another
+// capture. 512 slots covers the per-graph MMQ kernel count of any realistic
+// model (a 27B layer count x ~3 MMQ kernels per matmul stays well under this).
+constexpr int RING_SLOTS  = 512;
 constexpr int PRINT_EVERY_GRAPHS = 1024;
 
 enum kind : int {
@@ -91,7 +96,16 @@ __host__ __device__ inline int bucket_of(int ncols_y) {
 bool  enabled();
 void  on_kernel_begin(int kind_idx, int bucket, cudaStream_t stream);
 void  on_kernel_end(cudaStream_t stream);
-void  graph_begin(cudaStream_t stream);
+// Kind of compute a graph_begin/graph_end bracket. MQ_DIRECT = kernels run
+// directly on the stream (not captured); MQ_CAPTURE = a stream capture is about
+// to (re)record the kernels into a NEW graph; MQ_REPLAY = an existing graph is
+// re-executed (no new event records). This drives event-ring management: a
+// captured event becomes a node of its graph and must stay alive for the
+// graph's lifetime, so each capture gets a fresh, leaked ring, while direct and
+// replay reuse rings (direct reuses a shared ring; replay reuses the last
+// capture's ring, whose nodes are re-timed on each replay).
+enum mq_graph_kind { MQ_REPLAY, MQ_DIRECT, MQ_CAPTURE };
+void  graph_begin(cudaStream_t stream, mq_graph_kind kind);
 void  graph_end(cudaStream_t stream);
 // Flush the last in-flight graph (CUDA calls) and print the final summary.
 // Safe to call from ggml_backend_cuda_free, where the CUDA context is alive.

@@ -4425,8 +4425,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    mmq_profile::graph_begin(cuda_ctx->stream());
-
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4465,6 +4463,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    // MMQ profiler: bracket the graph compute. MQ_DIRECT = kernels run directly
+    // on the stream; MQ_CAPTURE = a capture is (re)recording the kernels into a
+    // new graph; MQ_REPLAY = an existing graph is re-executed.
+    const mmq_profile::mq_graph_kind mq_kind =
+        !use_cuda_graph             ? mmq_profile::MQ_DIRECT
+        : cuda_graph_update_required ? mmq_profile::MQ_CAPTURE
+                                     : mmq_profile::MQ_REPLAY;
+    mmq_profile::graph_begin(cuda_ctx->stream(), mq_kind);
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
