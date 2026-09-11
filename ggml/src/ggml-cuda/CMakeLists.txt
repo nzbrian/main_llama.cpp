@@ -56,6 +56,37 @@ if (CUDAToolkit_FOUND)
         endif()
     endif()
 
+    # "all" is passed through to nvcc as -arch=all and expanded at build time to plain
+    # targets (e.g. sm_120), which cannot use the architecture-specific Blackwell FP4
+    # tensor core instructions. Expand it here to the explicit list so that the
+    # 12X -> 12Xa replacement below can be applied.
+    if (CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)all($|;)")
+        set(ALL_ARCHS "")
+        if (CUDAToolkit_VERSION VERSION_LESS "13")
+            list(APPEND ALL_ARCHS 50-virtual 61-virtual 70-virtual)
+        endif()
+        list(APPEND ALL_ARCHS 75-virtual 80-virtual 86-real)
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+            list(APPEND ALL_ARCHS 89-real 90-virtual)
+        endif()
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND ALL_ARCHS 120a-real)
+        endif()
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.9")
+            list(APPEND ALL_ARCHS 121a-real)
+        endif()
+        set(EXPANDED_ARCHS "")
+        foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if (ARCH STREQUAL "all")
+                list(APPEND EXPANDED_ARCHS ${ALL_ARCHS})
+            else()
+                list(APPEND EXPANDED_ARCHS ${ARCH})
+            endif()
+        endforeach()
+        message(STATUS "Expanding 'all' in CMAKE_CUDA_ARCHITECTURES to: ${EXPANDED_ARCHS}")
+        set(CMAKE_CUDA_ARCHITECTURES ${EXPANDED_ARCHS})
+    endif()
+
     enable_language(CUDA)
 
     # TODO: Remove once CCCL 3.2 has been released and bundled with CUDA Toolkit
