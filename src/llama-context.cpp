@@ -2576,6 +2576,7 @@ void llama_context::tensor_energy_accumulate(const ggml_cgraph * gf) {
         }
         tensor_energy_sums[param_idx] += ss;
     }
+}
 
 llm_graph_result * llama_context::get_gf_res_prev() {
     auto & res = gf_res_prev[n_outputs > 0];
