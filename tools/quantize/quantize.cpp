@@ -29,6 +29,7 @@ struct quant_option {
     std::string name;
     llama_ftype ftype;
     std::string desc;
+    llama_quant_recipe recipe = LLAMA_QUANT_RECIPE_NONE;
 };
 
 static const std::vector<quant_option> QUANT_OPTIONS = {
@@ -69,6 +70,11 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
+    { "Q8_K_M",   LLAMA_FTYPE_MOSTLY_Q8_0,     " 8.5 bpw recipe @2B: Q8_0 base, small/norm tensors in source type", LLAMA_QUANT_RECIPE_Q8_K_M },
+    { "Q8_K_L",   LLAMA_FTYPE_MOSTLY_Q8_0,     "10.5 bpw recipe @2B: Q8_K_M + token_embd in source type", LLAMA_QUANT_RECIPE_Q8_K_L },
+    { "Q8_K_XL",  LLAMA_FTYPE_MOSTLY_Q8_0,     "11.1 bpw recipe @2B: Q8_K_M + token_embd + GDN/SSM roles in source type", LLAMA_QUANT_RECIPE_Q8_K_XL },
+    { "UD-Q8_K_XL", LLAMA_FTYPE_MOSTLY_Q8_0,   " alias for Q8_K_XL (Unsloth Dynamic naming)", LLAMA_QUANT_RECIPE_Q8_K_XL },
+    { "UD_Q8_K_XL", LLAMA_FTYPE_MOSTLY_Q8_0,   " alias for Q8_K_XL (Unsloth Dynamic naming)", LLAMA_QUANT_RECIPE_Q8_K_XL },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
@@ -91,7 +97,7 @@ static bool striequals(const char * a, const char * b) {
     return *a == *b;
 }
 
-static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std::string & ftype_str_out) {
+static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, llama_quant_recipe & recipe, std::string & ftype_str_out) {
     std::string ftype_str;
 
     for (auto ch : ftype_str_in) {
@@ -100,15 +106,18 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
     for (const auto & it : QUANT_OPTIONS) {
         if (striequals(it.name.c_str(), ftype_str.c_str())) {
             ftype = it.ftype;
+            recipe = it.recipe;
             ftype_str_out = it.name;
             return true;
         }
     }
+    recipe = LLAMA_QUANT_RECIPE_NONE;
     try {
         int ftype_int = std::stoi(ftype_str);
         for (const auto & it : QUANT_OPTIONS) {
             if (it.ftype == ftype_int) {
                 ftype = it.ftype;
+                recipe = it.recipe;
                 ftype_str_out = it.name;
                 return true;
             }
@@ -567,7 +576,7 @@ int llama_quantize(int argc, char ** argv) {
 
     std::string ftype_str;
     std::string suffix = ".gguf";
-    if (try_parse_ftype(argv[arg_idx], params.ftype, ftype_str)) {
+    if (try_parse_ftype(argv[arg_idx], params.ftype, params.quant_recipe, ftype_str)) {
         // argv[arg_idx] is the ftype directly: <input> <ftype>
         if (!params.dry_run) {
             std::string fpath;
@@ -598,7 +607,7 @@ int llama_quantize(int argc, char ** argv) {
             fprintf(stderr, "%s: missing ftype\n", __func__);
             return 1;
         }
-        if (!try_parse_ftype(argv[arg_idx], params.ftype, ftype_str)) {
+        if (!try_parse_ftype(argv[arg_idx], params.ftype, params.quant_recipe, ftype_str)) {
             fprintf(stderr, "%s: invalid ftype '%s'\n", __func__, argv[arg_idx]);
             return 1;
         }

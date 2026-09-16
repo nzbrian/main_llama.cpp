@@ -161,6 +161,29 @@ extern "C" {
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 
+    // quantization recipes (mixed-precision presets selectable in llama-quantize).
+    // All recipes are Q8_0-based, matching the reference Unsloth Dynamic
+    // "UD-Q8_K_*" artifacts (the "K" is their recipe family name; the official
+    // artifacts contain only Q8_0/F16/F32 tensors). Norms, the MoE router, GDN
+    // convolutional/1-D parameters and other small tensors are always kept in
+    // their source type (the standard engine keep-rules). The tiers promote
+    // progressively more tensors to source precision (F16/BF16):
+    //  - Q8_K_M:  plain Q8_0 base + keep rules ("8-bit" tier)
+    //  - Q8_K_L:  Q8_K_M + token_embd at source precision
+    //  - Q8_K_XL: Q8_K_M + token_embd + GDN/SSM-specific roles (attn_gate,
+    //    ssm_alpha, ssm_beta, ssm_out) at source precision.
+    //    "UD-Q8_K_XL" is an alias of Q8_K_XL. This is the deterministic
+    //    structural floor of the reference UD-Q8_K_XL artifacts; the reference
+    //    models additionally promote a handful of calibration-selected
+    //    ffn/attention tensors, which is not reproducible without calibration
+    //    and is not included here.
+    enum llama_quant_recipe {
+        LLAMA_QUANT_RECIPE_NONE   = 0, // plain ftype quantization (default)
+        LLAMA_QUANT_RECIPE_Q8_K_M = 1, // Q8_0 base + keep rules
+        LLAMA_QUANT_RECIPE_Q8_K_L = 2, // Q8_K_M + token_embd at source precision
+        LLAMA_QUANT_RECIPE_Q8_K_XL = 3, // Q8_K_M + token_embd + GDN/SSM roles at source precision
+    };
+
     // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
     LLAMA_API const char * llama_ftype_name(enum llama_ftype ftype);
 
@@ -447,6 +470,7 @@ extern "C" {
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
+        enum llama_quant_recipe quant_recipe;                       // quantization recipe (LLAMA_QUANT_RECIPE_NONE for plain ftype quantization)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

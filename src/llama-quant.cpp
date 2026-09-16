@@ -732,6 +732,35 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
         }
 
+        // quantization recipes (mixed-precision presets) - manual tensor-type patterns still take precedence.
+        // The recipe defines the base type; params.ftype is used for model metadata only.
+        if (!manual && qs.params->quant_recipe != LLAMA_QUANT_RECIPE_NONE) {
+            const std::string name(tensor->name);
+            bool keep_source = false;
+            // The reference UD-Q8_K_XL artifacts (and their "Q8_K" family name) are
+            // Q8_0-based: the official 2B artifact contains only Q8_0/F16/F32 tensors.
+            // The tiers promote progressively more tensors to source precision:
+            //  - Q8_K_L:  the token embedding only
+            //  - Q8_K_XL: token embedding + GDN/SSM-specific roles
+            // (structural floor; the reference models additionally promote a handful of
+            // calibration-selected ffn/attention tensors, which is not reproducible
+            // without calibration)
+            if (qs.params->quant_recipe == LLAMA_QUANT_RECIPE_Q8_K_L) {
+                if (name == "token_embd.weight") {
+                    keep_source = true;
+                }
+            } else { // LLAMA_QUANT_RECIPE_Q8_K_XL
+                if (name.find(".attn_gate.") != std::string::npos ||
+                    name.find(".ssm_alpha.") != std::string::npos ||
+                    name.find(".ssm_beta.") != std::string::npos ||
+                    name.find(".ssm_out.") != std::string::npos ||
+                    name == "token_embd.weight") {
+                    keep_source = true;
+                }
+            }
+            new_type = keep_source ? tensor->type : GGML_TYPE_Q8_0;
+        }
+
         // incompatible tensor shapes are handled here - fallback to a compatible type
         new_type = tensor_type_fallback(qs, tensor, new_type);
     }
@@ -1381,7 +1410,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.quant_recipe                =*/ LLAMA_QUANT_RECIPE_NONE
     };
 
     return result;
