@@ -749,7 +749,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
                 if (name == "token_embd.weight") {
                     keep_source = true;
                 }
-            } else { // LLAMA_QUANT_RECIPE_Q8_K_XL
+            } else if (qs.params->quant_recipe == LLAMA_QUANT_RECIPE_Q8_K_XL) {
                 if (name.find(".attn_gate.") != std::string::npos ||
                     name.find(".ssm_alpha.") != std::string::npos ||
                     name.find(".ssm_beta.") != std::string::npos ||

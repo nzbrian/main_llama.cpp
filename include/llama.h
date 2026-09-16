@@ -164,9 +164,9 @@ extern "C" {
     // quantization recipes (mixed-precision presets selectable in llama-quantize).
     // All recipes are Q8_0-based, matching the reference Unsloth Dynamic
     // "UD-Q8_K_*" artifacts (the "K" is their recipe family name; the official
-    // artifacts contain only Q8_0/F16/F32 tensors). Norms, the MoE router, GDN
-    // convolutional/1-D parameters and other small tensors are always kept in
-    // their source type (the standard engine keep-rules). The tiers promote
+    // artifacts contain only Q8_0/F16/F32 tensors). Tensors the standard engine
+    // keep-rules preserve (e.g. F32-source tensors such as norms and 1-D
+    // parameters) stay in their source type as usual. The tiers promote
     // progressively more tensors to source precision (F16/BF16):
     //  - Q8_K_M:  plain Q8_0 base + keep rules ("8-bit" tier)
     //  - Q8_K_L:  Q8_K_M + token_embd at source precision

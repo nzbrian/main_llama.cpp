@@ -2134,7 +2134,7 @@ size_t quantize_q6_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 }
 
 size_t quantize_q8_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights); // Q8_K per-32 scales do not use an imatrix
+    GGML_UNUSED(quant_weights); // Q8_K uses a single f32 scale per 256 and does not consume an imatrix
     quantize_row_q8_K_ref(src, (block_q8_K *)dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_Q8_K, n_per_row);
 }
