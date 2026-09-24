@@ -265,6 +265,21 @@ static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const in
     y[96] = ggml_cuda_cast<dst_t>(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
 }
 
+template <typename dst_t>
+static __device__ __forceinline__ void dequantize_q8_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_q8_K * x = (const block_q8_K *) vx;
+
+    const float d    = x[ib].d;
+    const int8_t * qs = x[ib].qs + 4*tid; // assume 64 threads
+
+    dst_t * y = yy + 4*tid;
+
+    y[0] = ggml_cuda_cast<dst_t>(d * qs[0]);
+    y[1] = ggml_cuda_cast<dst_t>(d * qs[1]);
+    y[2] = ggml_cuda_cast<dst_t>(d * qs[2]);
+    y[3] = ggml_cuda_cast<dst_t>(d * qs[3]);
+}
+
 //================================== i-quants
 
 // Each call dequantizes one super-block of QK_K values into y with 32

@@ -242,6 +242,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
 
 #define VDR_Q8_0_Q8_1_MMVQ 2
 #define VDR_Q8_0_Q8_1_MMQ 8
+#define VDR_Q8_K_Q8_1_MMVQ 2 // q8_K has the same int8 layout as q8_0 (one f32 scale per block)
 
 template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
     const int * v, const int * u, const T & d8_0, const T & d8_1) {
@@ -863,6 +864,30 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     }
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
+static __device__ __forceinline__ float vec_dot_q8_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q8_K * bq8_K = (const block_q8_K *) vbq + kbx;
+
+    // The 256-elem q8_K block spans 8 q8_1 activation blocks (32 elems each,
+    // each with its own scale).  This thread owns weight quants [4*iqs,
+    // 4*iqs+8) — 4*iqs is a multiple of 8, so all 8 land in ONE activation
+    // block (unlike q8_0, whose 32-elem block coincides with a single q8_1
+    // block and can index a single block only).
+    const int j0  = 4 * iqs;
+    const int sub = j0 / QK8_1;          // 0..7
+    const int ii  = (j0 % QK8_1) / 4;    // 0,2,4,6
+    const block_q8_1 * b8 = bq8_1 + sub;
+
+    int v[2], u[2];
+    v[0] = get_int_b2(bq8_K->qs, iqs + 0);
+    v[1] = get_int_b2(bq8_K->qs, iqs + 1);
+    u[0] = get_int_b4(b8->qs, ii + 0);
+    u[1] = get_int_b4(b8->qs, ii + 1);
+
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_K_Q8_1_MMVQ>(v, u, bq8_K->d, __low2half(b8->ds));
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
