@@ -70,6 +70,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
+    { "Q8_K",     LLAMA_FTYPE_MOSTLY_Q8_K,     " 9.13 bpw: 256 int8 + per-32 int16 sub-scales, single f32 scale",  },
     { "Q8_K_M",   LLAMA_FTYPE_MOSTLY_Q8_0,     " 8.5 bpw recipe @2B: Q8_0 base, small/norm tensors in source type", LLAMA_QUANT_RECIPE_Q8_K_M },
     { "Q8_K_L",   LLAMA_FTYPE_MOSTLY_Q8_0,     "10.5 bpw recipe @2B: Q8_K_M + token_embd in source type", LLAMA_QUANT_RECIPE_Q8_K_L },
     { "Q8_K_XL",  LLAMA_FTYPE_MOSTLY_Q8_0,     "11.1 bpw recipe @2B: Q8_K_M + token_embd + GDN/SSM roles in source type", LLAMA_QUANT_RECIPE_Q8_K_XL },
