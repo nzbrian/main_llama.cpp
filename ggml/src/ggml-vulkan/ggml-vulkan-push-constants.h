@@ -463,6 +463,7 @@ struct vk_op_rope_push_constants {
     uint32_t n_dims;
     uint32_t n_offs;
     float freq_scale;
+    uint32_t n_ctx_orig;
     float freq_base;
     float ext_factor;
     float attn_factor;

@@ -7,6 +7,7 @@ struct rope_params {
     uint n_dims;
     uint n_offs;
     float freq_scale;
+    uint n_ctx_orig;
     float freq_base;
     float ext_factor;
     float attn_factor;
