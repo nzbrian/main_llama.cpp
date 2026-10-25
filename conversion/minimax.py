@@ -137,12 +137,18 @@ class MiniMaxM2Model(TextModel):
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None
 
+            # quantization scales (e.g. mxfp8 .weight_scale_inv) are consumed by dequant_model;
+            # only the .weight tensors take part in the expert merge
+            if not name.endswith(".weight"):
+                return
+
             expert_cache = self._experts_cache.setdefault(bid, {})
             expert_cache[name] = data_torch
             expert_weights = ["w1", "w2", "w3"]
 
-            # not enough expert weights to merge
-            if len(expert_cache) < n_experts * len(expert_weights):
+            # merge once every expected expert weight is cached (robust to ordering/extra tensors)
+            if any(f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w}.weight" not in expert_cache
+                    for xid in range(n_experts) for w in expert_weights):
                 return
 
             for w_name in expert_weights:
