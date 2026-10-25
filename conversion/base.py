@@ -364,13 +364,14 @@ class ModelBase:
                 return weight.float() * scale
 
             def dequant_mxfp8(weight: Tensor, scale: Tensor) -> Tensor:
-                # OCP MX: e8m0 shared exponent (bias 127), one scale per 32-element block
+                # OCP MX: e8m0 shared exponent (bias 127), one scale per block
                 e8m0 = getattr(torch, "float8_e8m0fnu", None)
                 if e8m0 is not None and scale.dtype == e8m0:
                     scale_f = scale.float()
                 else:
                     scale_f = torch.exp2(scale.view(torch.uint8).float() - 127.0)
-                return dequant_simple(weight, scale_f, block_size=[32])
+                block_size = weight.shape[-1] // scale.shape[-1]
+                return dequant_simple(weight, scale_f, block_size=[block_size])
 
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
@@ -580,9 +581,13 @@ class ModelBase:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "mxfp8":
                 for name in list(self.model_tensors.keys()):
-                    if not name.endswith(".weight_scale"):
+                    # mxfp8 scales are named .weight_scale or .weight_scale_inv by producer
+                    if name.endswith(".weight_scale_inv"):
+                        weight_name = name.removesuffix("_scale_inv")
+                    elif name.endswith(".weight_scale"):
+                        weight_name = name.removesuffix("_scale")
+                    else:
                         continue
-                    weight_name = name.removesuffix("_scale")
                     if weight_name not in self.model_tensors:
                         tensors_to_remove.append(name)
                         continue
