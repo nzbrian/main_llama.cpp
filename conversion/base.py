@@ -363,6 +363,15 @@ class ModelBase:
 
                 return weight.float() * scale
 
+            def dequant_mxfp8(weight: Tensor, scale: Tensor) -> Tensor:
+                # OCP MX: e8m0 shared exponent (bias 127), one scale per 32-element block
+                e8m0 = getattr(torch, "float8_e8m0fnu", None)
+                if e8m0 is not None and scale.dtype == e8m0:
+                    scale_f = scale.float()
+                else:
+                    scale_f = torch.exp2(scale.view(torch.uint8).float() - 127.0)
+                return dequant_simple(weight, scale_f, block_size=[32])
+
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
                 bits = quant_config["bits"]
@@ -569,6 +578,23 @@ class ModelBase:
                                 tensors_to_remove.append(base_name + "_zero_point")
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
+            elif quant_method == "mxfp8":
+                for name in list(self.model_tensors.keys()):
+                    if not name.endswith(".weight_scale"):
+                        continue
+                    weight_name = name.removesuffix("_scale")
+                    if weight_name not in self.model_tensors:
+                        tensors_to_remove.append(name)
+                        continue
+                    w = self.model_tensors[weight_name]
+                    s = self.model_tensors[name]
+                    is_fp8_weight = False
+                    if self._fp8_as_q8:
+                        is_fp8_weight = w().dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    self.model_tensors[weight_name] = lambda w=w, s=s: dequant_mxfp8(w(), s())
+                    tensors_to_remove.append(name)
+                    if is_fp8_weight:
+                        self._fp8_dequantized.add(weight_name)
             elif quant_method in ("modelopt", "modelopt_mixed"):
                 dequant_fp8()
             elif quant_method is not None:
