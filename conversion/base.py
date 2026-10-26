@@ -373,6 +373,19 @@ class ModelBase:
                 block_size = weight.shape[-1] // scale.shape[-1]
                 return dequant_simple(weight, scale_f, block_size=[block_size])
 
+            def dequant_nvfp4(weight: Tensor, scale: Tensor, scale2: Tensor) -> Tensor:
+                # NVFP4: 4-bit E2M1 weights (2/byte), FP8 E4M3 block scale (1/16 elems), FP32 global scale
+                lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+                w = weight.view(torch.uint8)
+                out, half_in = w.shape
+                lo = (w & 0x0F).to(torch.int32)
+                hi = (w >> 4).to(torch.int32)
+                sign_lo = torch.where((lo >> 3) & 1, -1.0, 1.0)
+                sign_hi = torch.where((hi >> 3) & 1, -1.0, 1.0)
+                vals = torch.stack([lut[lo & 0x07] * sign_lo, lut[hi & 0x07] * sign_hi], dim=-1).reshape(out, half_in * 2)
+                scale = scale.float().repeat_interleave(16, dim=-1)
+                return vals * scale * scale2.float()
+
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
                 bits = quant_config["bits"]
@@ -589,6 +602,25 @@ class ModelBase:
                     else:
                         continue
                     if weight_name not in self.model_tensors:
+                        # NVFP4 layout: weight stored as .weight_packed (4-bit E2M1) with .weight_scale and
+                        # .weight_global_scale. Mixed models (mxfp8 dense + NVFP4 MoE experts) declare
+                        # quant_method=mxfp8, so the packed weight is caught here and dequantized to float.
+                        packed_name = weight_name.removesuffix(".weight") + ".weight_packed"
+                        if packed_name in self.model_tensors:
+                            base = packed_name.removesuffix(".weight_packed")
+                            gscale_name = base + ".weight_global_scale"
+                            iscale_name = base + ".input_global_scale"
+                            w = self.model_tensors[packed_name]
+                            s = self.model_tensors[name]
+                            gscale = self.model_tensors.get(gscale_name, lambda: torch.tensor(1.0))
+                            self.model_tensors[weight_name] = lambda w=w, s=s, gscale=gscale: dequant_nvfp4(w(), s(), gscale())
+                            tensors_to_remove.extend([name, packed_name])
+                            if gscale_name in self.model_tensors:
+                                tensors_to_remove.append(gscale_name)
+                            if iscale_name in self.model_tensors:
+                                tensors_to_remove.append(iscale_name)
+                            self._fp8_dequantized.add(weight_name)
+                            continue
                         tensors_to_remove.append(name)
                         continue
                     w = self.model_tensors[weight_name]
