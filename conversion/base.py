@@ -380,8 +380,8 @@ class ModelBase:
                 out, half_in = w.shape
                 lo = (w & 0x0F).to(torch.int32)
                 hi = (w >> 4).to(torch.int32)
-                sign_lo = torch.where((lo >> 3) & 1, -1.0, 1.0)
-                sign_hi = torch.where((hi >> 3) & 1, -1.0, 1.0)
+                sign_lo = torch.where(((lo >> 3) & 1).bool(), -1.0, 1.0)
+                sign_hi = torch.where(((hi >> 3) & 1).bool(), -1.0, 1.0)
                 vals = torch.stack([lut[lo & 0x07] * sign_lo, lut[hi & 0x07] * sign_hi], dim=-1).reshape(out, half_in * 2)
                 scale = scale.float().repeat_interleave(16, dim=-1)
                 return vals * scale * scale2.float()
