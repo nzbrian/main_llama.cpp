@@ -384,7 +384,9 @@ class ModelBase:
                 sign_hi = torch.where(((hi >> 3) & 1).bool(), -1.0, 1.0)
                 vals = torch.stack([lut[lo & 0x07] * sign_lo, lut[hi & 0x07] * sign_hi], dim=-1).reshape(out, half_in * 2)
                 scale = scale.float().repeat_interleave(16, dim=-1)
-                return vals * scale * scale2.float()
+                # float16 halves the expert cache/merge memory; Q8_0's 7-bit mantissa is the
+                # limiting factor, so no extra precision is lost vs float32
+                return (vals * scale * scale2.float()).to(torch.float16)
 
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:

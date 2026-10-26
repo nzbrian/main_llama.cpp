@@ -145,26 +145,23 @@ class MiniMaxM2Model(TextModel):
             expert_cache = self._experts_cache.setdefault(bid, {})
             expert_cache[name] = data_torch
             expert_weights = ["w1", "w2", "w3"]
+            prefix = f"model.layers.{bid}.block_sparse_moe.experts."
 
-            # merge once every expected expert weight is cached (robust to ordering/extra tensors)
-            if any(f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w}.weight" not in expert_cache
-                    for xid in range(n_experts) for w in expert_weights):
-                return
-
+            # merge each weight type as soon as all its experts are cached, filling a
+            # preallocated buffer in-place (freeing each source as it is copied) so peak
+            # memory is one type's cache + one output tensor, not all types + a stack copy
             for w_name in expert_weights:
-                datas: list[Tensor] = []
-
-                for xid in range(n_experts):
-                    ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                    datas.append(expert_cache[ename])
-                    del expert_cache[ename]
-
-                data_torch = torch.stack(datas, dim=0)
-                merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
-                new_name = self.map_tensor_name(merged_name)
-                yield from super().modify_tensors(data_torch, new_name, bid)
-
-            del self._experts_cache[bid]
+                if all(f"{prefix}{xid}.{w_name}.weight" in expert_cache for xid in range(n_experts)):
+                    first = expert_cache[f"{prefix}0.{w_name}.weight"]
+                    out = torch.empty((n_experts,) + tuple(first.shape), dtype=first.dtype)
+                    for xid in range(n_experts):
+                        ename = f"{prefix}{xid}.{w_name}.weight"
+                        out[xid] = expert_cache[ename]
+                        del expert_cache[ename]
+                    new_name = self.map_tensor_name(f"{prefix}{w_name}.weight")
+                    yield from super().modify_tensors(out, new_name, bid)
+                    if not expert_cache:
+                        del self._experts_cache[bid]
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
