@@ -373,21 +373,6 @@ class ModelBase:
                 block_size = weight.shape[-1] // scale.shape[-1]
                 return dequant_simple(weight, scale_f, block_size=[block_size])
 
-            def dequant_nvfp4(weight: Tensor, scale: Tensor, scale2: Tensor) -> Tensor:
-                # NVFP4: 4-bit E2M1 weights (2/byte), FP8 E4M3 block scale (1/16 elems), FP32 global scale
-                lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
-                w = weight.view(torch.uint8)
-                out, half_in = w.shape
-                lo = (w & 0x0F).to(torch.int32)
-                hi = (w >> 4).to(torch.int32)
-                sign_lo = torch.where(((lo >> 3) & 1).bool(), -1.0, 1.0)
-                sign_hi = torch.where(((hi >> 3) & 1).bool(), -1.0, 1.0)
-                vals = torch.stack([lut[lo & 0x07] * sign_lo, lut[hi & 0x07] * sign_hi], dim=-1).reshape(out, half_in * 2)
-                scale = scale.float().repeat_interleave(16, dim=-1)
-                # float16 halves the expert cache/merge memory; Q8_0's 7-bit mantissa is the
-                # limiting factor, so no extra precision is lost vs float32
-                return (vals * scale * scale2.float()).to(torch.float16)
-
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
                 bits = quant_config["bits"]
@@ -604,24 +589,12 @@ class ModelBase:
                     else:
                         continue
                     if weight_name not in self.model_tensors:
-                        # NVFP4 layout: weight stored as .weight_packed (4-bit E2M1) with .weight_scale and
-                        # .weight_global_scale. Mixed models (mxfp8 dense + NVFP4 MoE experts) declare
-                        # quant_method=mxfp8, so the packed weight is caught here and dequantized to float.
+                        # NVFP4 layout: weight stored as .weight_packed (4-bit E2M1). Mixed models
+                        # (mxfp8 dense + NVFP4 MoE experts) declare quant_method=mxfp8, so the packed
+                        # weight is caught here. Repack it directly to GGUF NVFP4 (no float round-trip)
+                        # in _repack_mixed_nvfp4_experts - leave the tensors for that pass.
                         packed_name = weight_name.removesuffix(".weight") + ".weight_packed"
                         if packed_name in self.model_tensors:
-                            base = packed_name.removesuffix(".weight_packed")
-                            gscale_name = base + ".weight_global_scale"
-                            iscale_name = base + ".input_global_scale"
-                            w = self.model_tensors[packed_name]
-                            s = self.model_tensors[name]
-                            gscale = self.model_tensors.get(gscale_name, lambda: torch.tensor(1.0))
-                            self.model_tensors[weight_name] = lambda w=w, s=s, gscale=gscale: dequant_nvfp4(w(), s(), gscale())
-                            tensors_to_remove.extend([name, packed_name])
-                            if gscale_name in self.model_tensors:
-                                tensors_to_remove.append(gscale_name)
-                            if iscale_name in self.model_tensors:
-                                tensors_to_remove.append(iscale_name)
-                            self._fp8_dequantized.add(weight_name)
                             continue
                         tensors_to_remove.append(name)
                         continue
@@ -634,6 +607,7 @@ class ModelBase:
                     tensors_to_remove.append(name)
                     if is_fp8_weight:
                         self._fp8_dequantized.add(weight_name)
+                self._repack_mixed_nvfp4_experts()
             elif quant_method in ("modelopt", "modelopt_mixed"):
                 dequant_fp8()
             elif quant_method is not None:
@@ -1191,6 +1165,64 @@ class ModelBase:
         self._write_scales_tensor(new_name.replace(".weight", ".input_scale"), [s[1] for s in input_scales])
 
         del experts, merged
+
+    def _repack_mixed_nvfp4_experts(self):
+        # mxfp8-mixed models: NVFP4 MoE experts are stored as .weight_packed (4-bit E2M1) with
+        # .weight_scale / .weight_global_scale / .input_global_scale. Repack them directly to
+        # GGUF NVFP4 (no float round-trip) and merge per (layer, w) into [n_experts, ...].
+        expert_data: dict[tuple[int, str], dict[int, dict]] = {}
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".weight_packed"):
+                continue
+            base = name.removesuffix(".weight_packed")
+            scale_name = base + ".weight_scale"
+            if scale_name not in self.model_tensors:
+                continue
+            m = re.search(r'\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)$', base)
+            if not m:
+                continue
+            bid = int(m.group(1))
+            xid = int(m.group(2))
+            w_name = m.group(3)
+            gscale_name = base + ".weight_global_scale"
+            iscale_name = base + ".input_global_scale"
+            expert_data.setdefault((bid, w_name), {})[xid] = {
+                "packed_name": name,
+                "scale_name": scale_name,
+                "gscale_name": gscale_name,
+                "iscale_name": iscale_name,
+                "packed": self.model_tensors[name],
+                "scale": self.model_tensors[scale_name],
+                "gscale": self.model_tensors.get(gscale_name, lambda: torch.tensor(1.0)),
+                "iscale": self.model_tensors.get(iscale_name, lambda: torch.tensor(1.0)),
+            }
+        for (bid, w_name), experts_by_id in expert_data.items():
+            ids = sorted(experts_by_id)
+            raws = []
+            scales = []
+            iscales = []
+            shape = None
+            for xid in ids:
+                e = experts_by_id[xid]
+                raw, shape = self._nvfp4_pack(
+                    LazyTorchTensor.to_eager(e["packed"]()),
+                    LazyTorchTensor.to_eager(e["scale"]())
+                )
+                raws.append(raw)
+                scales.append(float(LazyTorchTensor.to_eager(e["gscale"]()).float().sum()))
+                iscales.append(float(LazyTorchTensor.to_eager(e["iscale"]()).float().sum()))
+            merged = np.stack(raws, axis=0)
+            merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
+            new_name = self.map_tensor_name(merged_name)
+            logger.info(f"Repacked {new_name} with shape [{len(ids)}, {shape[0]}, {shape[1]}] and quantization NVFP4")
+            self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
+            self._tag_prec_a4(merged_name, new_name)
+            self._write_scales_tensor(new_name.replace(".weight", ".scale"), scales)
+            self._write_scales_tensor(new_name.replace(".weight", ".input_scale"), iscales)
+            for xid in ids:
+                e = experts_by_id[xid]
+                for tname in (e["packed_name"], e["scale_name"], e["gscale_name"], e["iscale_name"]):
+                    self.model_tensors.pop(tname, None)
 
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
