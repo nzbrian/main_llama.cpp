@@ -137,6 +137,7 @@ class ModelBase:
                  fp8_as_q8: bool = False,
                  fuse_qkv: bool = False,
                  tensor_type_overrides: list | None = None,
+                 tensor_sources: list[str] | None = None,
                  imatrix_file: str | None = None,
                  ple_only: bool = False, no_ple: bool = False):
         if type(self) is ModelBase or \
@@ -169,6 +170,7 @@ class ModelBase:
         self._unfusable_gate_up_layers: set[int] = set()
         self.fuse_qkv = fuse_qkv
         self.tensor_type_overrides = tensor_type_overrides or []
+        self.tensor_sources = tensor_sources or []
         self.imatrix_file = imatrix_file or ""
         self._q_buffer: dict[int, Tensor] = {}
         self._k_buffer: dict[int, Tensor] = {}
@@ -1253,6 +1255,33 @@ class ModelBase:
         if orig_ndim > 2:
             out = out.reshape(orig_shape[:-1] + (npr // block * tsize,))
         return out, qtype
+
+    @property
+    def _source_readers(self):
+        # lazily open the source GGUFs (memory-mapped, cheap) and index their tensors by name
+        cached = getattr(self, "_source_readers_cache", None)
+        if cached is not None:
+            return cached
+        from gguf import GGUFReader
+        readers = []
+        for path in self.tensor_sources:
+            reader = GGUFReader(path)
+            reader.tensors_by_name = {t.name: t for t in reader.tensors}
+            readers.append(reader)
+        self._source_readers_cache = readers
+        return readers
+
+    def _copy_from_source(self, gguf_name: str, expected_shape: tuple[int, ...] | None = None):
+        # return (raw_bytes, qtype) if the tensor is in a source model with a matching shape, else None.
+        # the copied tensor keeps the source's quant type, so no imatrix is needed for it
+        for reader in self._source_readers:
+            rt = reader.tensors_by_name.get(gguf_name)
+            if rt is None:
+                continue
+            if expected_shape is not None and tuple(int(d) for d in rt.shape) != tuple(expected_shape):
+                continue
+            return rt.data, rt.tensor_type
+        return None
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if name in self._fp8_e4m3_preserved and n_dims >= 2:

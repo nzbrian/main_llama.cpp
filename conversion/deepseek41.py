@@ -228,6 +228,14 @@ class DeepseekV41Model(DeepseekV4Model):
         cols = packed_cols * 2
 
         gguf_name = self.format_tensor_name(key, bid)
+        # copy the pre-quantized experts from a source model if available (avoids re-quantizing)
+        if self.tensor_sources:
+            copied = self._copy_from_source(gguf_name, (n_expert, rows, cols))
+            if copied is not None:
+                data, src_qtype = copied
+                logger.info(f"{gguf_name}: {n_expert} experts copied from source as {src_qtype.name}")
+                self.gguf_writer.add_tensor(gguf_name, data, raw_dtype=src_qtype)
+                return
         data_qtype = self._expert_tensor_type(gguf_name, cols)
         logger.info(f"{gguf_name}: {n_expert} experts -> {data_qtype.name}")
 

@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
         help="file with one 'gguf_name=type' per entry (whitespace separated) giving per-tensor quant targets; first match wins. Same format as llama-quantize --tensor-type-file.",
     )
     parser.add_argument(
+        "--tensor-source", type=Path, action="append", default=[], metavar="FILE",
+        help="GGUF model to copy pre-quantized tensors from, by matching tensor name (first source with the tensor wins). The copied tensor keeps the source's quant type, so the imatrix is not needed for it. Use to graft low-bit experts from an existing quant instead of re-quantizing. May be specified multiple times.",
+    )
+    parser.add_argument(
         "--imatrix", type=Path, metavar="FILE",
         help="importance matrix file (from llama-imatrix); required for low-bit I-quants (iq1_s, iq1_m, iq2_xxs/xs/s, iq3_xxs). The conversion fails if a tensor targets an imatrix type but no matching imatrix entry is available.",
     )
@@ -367,6 +371,7 @@ def main() -> None:
                                      fp8_as_q8=args.fp8_as_q8,
                                      fuse_qkv=args.fuse_qkv,
                                      tensor_type_overrides=tensor_type_overrides,
+                                     tensor_sources=[str(p) for p in args.tensor_source],
                                      imatrix_file=str(args.imatrix) if args.imatrix else None,
                                      ple_only=args.ple_only, no_ple=args.no_ple,
                                      )
