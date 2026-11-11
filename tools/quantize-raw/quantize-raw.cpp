@@ -80,15 +80,23 @@ int main(int argc, char ** argv) {
     }
 
     // load the imatrix for this tensor: required for low-bit I-quants, optional otherwise.
-    // the imatrix has one value per column (n_per_row), reused across all rows - matching
-    // ggml's quantize kernels, which apply the same n_per_row weights to every row.
+    // the imatrix has n_groups = ne[2]*ne[3] groups of n_per_row values; group g covers
+    // ne[1] consecutive rows and is applied as imatrix + g*n_per_row (mirrors ggml's
+    // imatrix_for_row). a 2D tensor is the single-group case.
     std::vector<float> imatrix;
     const float * imatrix_ptr = nullptr;
+    size_t n_imatrix_groups = 1;
     const bool needs_imatrix = ggml_quantize_requires_imatrix(type);
     if (!imatrix_file.empty() && load_imatrix_for_tensor(imatrix_file, tensor_name, imatrix)) {
-        if (imatrix.size() != (size_t) n_per_row) {
-            fprintf(stderr, "%s: imatrix size %zu != n_per_row %lld for '%s'\n",
+        if (imatrix.size() < (size_t) n_per_row || (imatrix.size() % (size_t) n_per_row) != 0) {
+            fprintf(stderr, "%s: imatrix size %zu not a multiple of n_per_row %lld for '%s'\n",
                     argv[0], imatrix.size(), (long long) n_per_row, tensor_name.c_str());
+            return 1;
+        }
+        n_imatrix_groups = imatrix.size() / (size_t) n_per_row;
+        if (nrows % (int64_t) n_imatrix_groups != 0) {
+            fprintf(stderr, "%s: nrows %lld not divisible by imatrix groups %zu for '%s'\n",
+                    argv[0], (long long) nrows, n_imatrix_groups, tensor_name.c_str());
             return 1;
         }
         imatrix_ptr = imatrix.data();
@@ -106,7 +114,19 @@ int main(int argc, char ** argv) {
 
     const size_t row_size = ggml_row_size(type, n_per_row);
     std::vector<uint8_t> dst((size_t) nrows * row_size);
-    ggml_quantize_chunk(type, src.data(), dst.data(), 0, nrows, n_per_row, imatrix_ptr);
+    if (imatrix_ptr == nullptr) {
+        ggml_quantize_chunk(type, src.data(), dst.data(), 0, nrows, n_per_row, nullptr);
+    } else {
+        const int64_t rows_per_group = nrows / (int64_t) n_imatrix_groups;
+        for (size_t g = 0; g < n_imatrix_groups; ++g) {
+            const int64_t row_start = (int64_t) g * rows_per_group;
+            ggml_quantize_chunk(type,
+                src.data() + row_start * n_per_row,
+                dst.data()  + row_start * row_size,
+                0, rows_per_group, n_per_row,
+                imatrix_ptr + g * n_per_row);
+        }
+    }
 
     if (fwrite(dst.data(), 1, dst.size(), stdout) != dst.size()) {
         fprintf(stderr, "%s: failed to write output\n", argv[0]);
