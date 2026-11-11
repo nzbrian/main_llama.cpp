@@ -230,7 +230,7 @@ class DeepseekV41Model(DeepseekV4Model):
         gguf_name = self.format_tensor_name(key, bid)
         data_qtype = self._expert_tensor_type(gguf_name, cols)
         # copy the pre-quantized experts from a source model if it has them with the same type
-        # (avoids re-quantizing); a type mismatch (e.g. source Q5_K vs target Q6_K) falls through
+        # (avoids re-quantizing); a type/shape mismatch falls through to quantization
         if self.tensor_sources:
             copied = self._copy_from_source(gguf_name, (n_expert, rows, cols), data_qtype)
             if copied is not None:
@@ -238,6 +238,15 @@ class DeepseekV41Model(DeepseekV4Model):
                 logger.info(f"{gguf_name}: {n_expert} experts copied from source as {src_qtype.name}")
                 self.gguf_writer.add_tensor(gguf_name, data, raw_dtype=src_qtype)
                 return
+            # diagnostic: show why no donor matched (shards loaded, tensor found?, its shape/type)
+            want = (n_expert, rows, cols)
+            hits = []
+            for i, rd in enumerate(self._source_readers):
+                rt = rd.tensors_by_name.get(gguf_name)
+                if rt is not None:
+                    hits.append(f"shard{i}: shape={list(rt.shape)} type={rt.tensor_type.name}")
+            logger.info(f"{gguf_name}: NO donor copy (want shape={want} type={data_qtype.name}); "
+                        f"donor shards={len(self._source_readers)}; found: {hits or 'none'}")
         logger.info(f"{gguf_name}: {n_expert} experts -> {data_qtype.name}")
 
         def dequant(eid: int) -> np.ndarray:
