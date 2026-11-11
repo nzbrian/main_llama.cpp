@@ -12,6 +12,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
+from . import quant_mix
 from .base import LazyTorchTensor, ModelBase, TextModel, gguf
 from .deepseek import DeepseekV4FlashVisionModel, DeepseekV4Model
 
@@ -210,10 +211,9 @@ class DeepseekV41Model(DeepseekV4Model):
         with open(index, "r", encoding="utf-8") as f:
             return self.dir_model / json.load(f)["weight_map"][name]
 
-    def _dequant_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR, n_expert: int | None = None) -> Iterable[tuple[str, Tensor]]:
-        # dequantize the MXFP4 routed experts to f32 and yield them, so the main export loop
-        # quantizes them per --tensor-type-file / --outtype (with imatrix) instead of copying
-        # them bit-exact as MXFP4
+    def _quant_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR, n_expert: int | None = None) -> None:
+        # dequantize the MXFP4 routed experts to f32, quantize per --tensor-type-file / --outtype
+        # (with imatrix), and write; replaces the old bit-exact MXFP4 copy so low-bit configs apply
         n_expert = self.hparams["n_routed_experts"] if n_expert is None else n_expert
         names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(n_expert)]
         pairs = [(self.model_tensors.pop(n + ".weight"), self.model_tensors.pop(n + ".scale")) for n in names]
@@ -224,7 +224,36 @@ class DeepseekV41Model(DeepseekV4Model):
         for eid, (w, s) in enumerate(pairs):
             packed = self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(w()), LazyTorchTensor.to_eager(s()))
             out[eid] = torch.from_numpy(gguf.quants.MXFP4.dequantize_blocks(packed.reshape(-1, 17)).reshape(rows, cols))
-        yield self.format_tensor_name(key, bid), out
+
+        gguf_name = self.format_tensor_name(key, bid)
+        data_qtype = self._expert_tensor_type(gguf_name, cols)
+        data = self._quantize_expert_data(out, gguf_name, data_qtype)
+        self.gguf_writer.add_tensor(gguf_name, data, raw_dtype=data_qtype)
+
+    def _expert_tensor_type(self, gguf_name: str, ncols: int) -> gguf.GGMLQuantizationType:
+        if self.tensor_type_overrides:
+            ov = quant_mix.match_override(self.tensor_type_overrides, gguf_name)
+            if ov is not None:
+                return quant_mix.tensor_type_fallback(gguf_name, ncols, ov)
+        if self.ftype in quant_mix.FTYPE_DEFAULT:
+            base = quant_mix.FTYPE_DEFAULT[self.ftype]
+            cat = quant_mix.tensor_category(gguf_name)
+            return quant_mix.tensor_type_fallback(gguf_name, ncols, quant_mix.get_tensor_type(self.ftype, cat, gguf_name, self._quant_ctx, base))
+        return {
+            gguf.LlamaFileType.ALL_F32: gguf.GGMLQuantizationType.F32,
+            gguf.LlamaFileType.MOSTLY_F16: gguf.GGMLQuantizationType.F16,
+            gguf.LlamaFileType.MOSTLY_BF16: gguf.GGMLQuantizationType.BF16,
+        }.get(self.ftype, gguf.GGMLQuantizationType.BF16)
+
+    def _quantize_expert_data(self, data_torch: Tensor, new_name: str, qtype: gguf.GGMLQuantizationType) -> np.ndarray:
+        if qtype in quant_mix.FLOAT_TYPES:
+            return data_torch.numpy()
+        if qtype == gguf.GGMLQuantizationType.F8_E4M3:
+            return data_torch.view(torch.uint8).numpy()
+        if qtype in quant_mix.PYTHON_QUANTIZABLE:
+            return gguf.quants.quantize(data_torch.numpy(), qtype)
+        data, _ = self._quantize_with_helper(data_torch, new_name, qtype)
+        return data
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
         # official lookup e4m3 * 2^(e8m0 - 127), exact in BF16
@@ -259,13 +288,14 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if not self._dsv4_mxfp4_generated:
-            self._dsv4_mxfp4_generated = True
             for bid in range(self.block_count):
-                yield from self._dequant_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP)
-                yield from self._dequant_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP)
-                yield from self._dequant_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP)
+                self._quant_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP)
+                self._quant_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP)
+                self._quant_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP)
             if self.hparams.get("engram_layer_ids"):
                 self._write_engram_tables(list(self.hparams["engram_layer_ids"]))
+            self._dsv4_mxfp4_generated = True
+        return ()
 
     _LAYER_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
         "attn.indexer.wk.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_K, ".weight"),
@@ -392,12 +422,13 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         # no Engram tables in the draft
         if not self._dsv4_mxfp4_generated:
-            self._dsv4_mxfp4_generated = True
             n_expert = self.hparams["dspark_n_routed_experts"]
             for bid in range(self._n_main, self._n_main + self._n_stage):
-                yield from self._dequant_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP, n_expert)
-                yield from self._dequant_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP, n_expert)
-                yield from self._dequant_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP, n_expert)
+                self._quant_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP, n_expert)
+                self._quant_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP, n_expert)
+                self._quant_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP, n_expert)
+            self._dsv4_mxfp4_generated = True
+        return ()
 
     _DSPARK_ROOT: dict[str, gguf.MODEL_TENSOR] = {
         "main_proj.weight": gguf.MODEL_TENSOR.FC,
