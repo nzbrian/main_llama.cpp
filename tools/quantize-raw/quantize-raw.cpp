@@ -1,5 +1,5 @@
 // quantize a raw f32 tensor to a ggml quant type
-// usage: quantize-raw <dst_type> <nrows> <n_per_row> [<tensor_name> <imatrix_file>]
+// usage: quantize-raw <dst_type> <nrows> <n_per_row> [<tensor_name> <imatrix_file> [<imatrix_group>]]
 // reads nrows * n_per_row f32 values from stdin, writes the quantized bytes to stdout
 //
 // used by convert_hf_to_gguf.py to quantize K/I-quants directly from safetensors,
@@ -49,16 +49,18 @@ static bool load_imatrix_for_tensor(const std::string & fname, const std::string
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4 && argc != 6) {
-        fprintf(stderr, "usage: %s <dst_type> <nrows> <n_per_row> [<tensor_name> <imatrix_file>]\n", argv[0]);
+    if (argc != 4 && argc != 6 && argc != 7) {
+        fprintf(stderr, "usage: %s <dst_type> <nrows> <n_per_row> [<tensor_name> <imatrix_file> [<imatrix_group>]]\n", argv[0]);
         return 1;
     }
 
     const ggml_type type      = (ggml_type) atoi(argv[1]);
     const int64_t   nrows     = atoll(argv[2]);
     const int64_t   n_per_row = atoll(argv[3]);
-    const std::string tensor_name  = (argc == 6) ? argv[4] : "";
-    const std::string imatrix_file = (argc == 6) ? argv[5] : "";
+    const std::string tensor_name  = (argc >= 6) ? argv[4] : "";
+    const std::string imatrix_file = (argc >= 6) ? argv[5] : "";
+    // optional: quantize these rows with a single imatrix slice (per-expert quantization)
+    const int64_t imatrix_group    = (argc >= 7) ? atoll(argv[6]) : -1;
 
     if (nrows <= 0 || n_per_row <= 0) {
         fprintf(stderr, "%s: invalid dimensions\n", argv[0]);
@@ -93,13 +95,23 @@ int main(int argc, char ** argv) {
                     argv[0], imatrix.size(), (long long) n_per_row, tensor_name.c_str());
             return 1;
         }
-        n_imatrix_groups = imatrix.size() / (size_t) n_per_row;
-        if (nrows % (int64_t) n_imatrix_groups != 0) {
-            fprintf(stderr, "%s: nrows %lld not divisible by imatrix groups %zu for '%s'\n",
-                    argv[0], (long long) nrows, n_imatrix_groups, tensor_name.c_str());
-            return 1;
+        if (imatrix_group >= 0) {
+            if ((size_t) imatrix_group * (size_t) n_per_row + (size_t) n_per_row > imatrix.size()) {
+                fprintf(stderr, "%s: imatrix group %lld out of range (size %zu, n_per_row %lld) for '%s'\n",
+                        argv[0], (long long) imatrix_group, imatrix.size(), (long long) n_per_row, tensor_name.c_str());
+                return 1;
+            }
+            n_imatrix_groups = 1;
+            imatrix_ptr = imatrix.data() + (size_t) imatrix_group * (size_t) n_per_row;
+        } else {
+            n_imatrix_groups = imatrix.size() / (size_t) n_per_row;
+            if (nrows % (int64_t) n_imatrix_groups != 0) {
+                fprintf(stderr, "%s: nrows %lld not divisible by imatrix groups %zu for '%s'\n",
+                        argv[0], (long long) nrows, n_imatrix_groups, tensor_name.c_str());
+                return 1;
+            }
+            imatrix_ptr = imatrix.data();
         }
-        imatrix_ptr = imatrix.data();
     }
 
     // low-bit I-quants cannot be quantized without an importance matrix

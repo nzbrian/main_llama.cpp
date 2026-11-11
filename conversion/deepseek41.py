@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from pathlib import Path
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 from . import quant_mix
 from .base import LazyTorchTensor, ModelBase, TextModel, gguf
 from .deepseek import DeepseekV4FlashVisionModel, DeepseekV4Model
+
+logger = logging.getLogger("hf-to-gguf")
 
 
 # Engram hash constants from inference/engram.py, stored in the GGUF: the token map needs the HF tokenizers
@@ -212,23 +215,39 @@ class DeepseekV41Model(DeepseekV4Model):
             return self.dir_model / json.load(f)["weight_map"][name]
 
     def _quant_mxfp4_experts(self, bid: int, proj: str, key: gguf.MODEL_TENSOR, n_expert: int | None = None) -> None:
-        # dequantize the MXFP4 routed experts to f32, quantize per --tensor-type-file / --outtype
-        # (with imatrix), and write; replaces the old bit-exact MXFP4 copy so low-bit configs apply
+        # dequantize the MXFP4 routed experts to f32 one at a time, quantize per --tensor-type-file
+        # / --outtype (with imatrix), and write; replaces the old bit-exact MXFP4 copy so low-bit
+        # configs apply. one expert at a time keeps the f32 footprint to a single expert (~tens of
+        # MB) instead of the full [n_expert, rows, cols] buffer
         n_expert = self.hparams["n_routed_experts"] if n_expert is None else n_expert
         names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(n_expert)]
         pairs = [(self.model_tensors.pop(n + ".weight"), self.model_tensors.pop(n + ".scale")) for n in names]
         rows, packed_cols = pairs[0][0]().shape
         cols = packed_cols * 2
 
-        out = torch.empty((n_expert, rows, cols), dtype=torch.float32)
-        for eid, (w, s) in enumerate(pairs):
-            packed = self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(w()), LazyTorchTensor.to_eager(s()))
-            out[eid] = torch.from_numpy(gguf.quants.MXFP4.dequantize_blocks(packed.reshape(-1, 17)).reshape(rows, cols))
-
         gguf_name = self.format_tensor_name(key, bid)
         data_qtype = self._expert_tensor_type(gguf_name, cols)
-        data = self._quantize_expert_data(out, gguf_name, data_qtype)
-        self.gguf_writer.add_tensor(gguf_name, data, raw_dtype=data_qtype)
+        logger.info(f"{gguf_name}: {n_expert} experts -> {data_qtype.name}")
+
+        def dequant(eid: int) -> np.ndarray:
+            packed = self.repack_mxfp4_blocks(LazyTorchTensor.to_eager(pairs[eid][0]()), LazyTorchTensor.to_eager(pairs[eid][1]()))
+            return gguf.quants.MXFP4.dequantize_blocks(packed.reshape(-1, 17)).reshape(rows, cols)
+
+        if data_qtype in quant_mix.FLOAT_TYPES:
+            out = np.empty((n_expert, rows, cols), dtype=np.float32)
+            for eid in range(n_expert):
+                out[eid] = dequant(eid)
+            self.gguf_writer.add_tensor(gguf_name, out, raw_dtype=data_qtype)
+            return
+
+        from gguf.constants import GGML_QUANT_SIZES
+        block, tsize = GGML_QUANT_SIZES[data_qtype]
+        qcols = cols // block * tsize
+        buf = np.empty((n_expert, rows, qcols), dtype=np.uint8)
+        for eid in range(n_expert):
+            q, _ = self._quantize_with_helper(torch.from_numpy(dequant(eid)), gguf_name, data_qtype, imatrix_group=eid)
+            buf[eid] = q
+        self.gguf_writer.add_tensor(gguf_name, buf, raw_dtype=data_qtype)
 
     def _expert_tensor_type(self, gguf_name: str, ncols: int) -> gguf.GGMLQuantizationType:
         if self.tensor_type_overrides:
@@ -244,16 +263,6 @@ class DeepseekV41Model(DeepseekV4Model):
             gguf.LlamaFileType.MOSTLY_F16: gguf.GGMLQuantizationType.F16,
             gguf.LlamaFileType.MOSTLY_BF16: gguf.GGMLQuantizationType.BF16,
         }.get(self.ftype, gguf.GGMLQuantizationType.BF16)
-
-    def _quantize_expert_data(self, data_torch: Tensor, new_name: str, qtype: gguf.GGMLQuantizationType) -> np.ndarray:
-        if qtype in quant_mix.FLOAT_TYPES:
-            return data_torch.numpy()
-        if qtype == gguf.GGMLQuantizationType.F8_E4M3:
-            return data_torch.view(torch.uint8).numpy()
-        if qtype in quant_mix.PYTHON_QUANTIZABLE:
-            return gguf.quants.quantize(data_torch.numpy(), qtype)
-        data, _ = self._quantize_with_helper(data_torch, new_name, qtype)
-        return data
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
         # official lookup e4m3 * 2^(e8m0 - 127), exact in BF16

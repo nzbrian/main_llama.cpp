@@ -1226,7 +1226,7 @@ class ModelBase:
         self._quantize_raw_path_cache = p
         return p
 
-    def _quantize_with_helper(self, data_torch: Tensor, new_name: str, qtype: gguf.GGMLQuantizationType) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
+    def _quantize_with_helper(self, data_torch: Tensor, new_name: str, qtype: gguf.GGMLQuantizationType, imatrix_group: int | None = None) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
         import subprocess
         arr = data_torch.detach().to(torch.float32).contiguous().numpy()
         orig_shape = arr.shape
@@ -1241,6 +1241,9 @@ class ModelBase:
         qtype = quant_mix.tensor_type_fallback("", npr, qtype)
         # pass the imatrix file (may be empty); the helper fails if the type requires one and it is missing
         cmd = [self._quantize_raw_path, str(int(qtype)), str(nrows), str(npr), new_name, self.imatrix_file]
+        if imatrix_group is not None:
+            # quantize these rows with a single imatrix slice (per-expert quantization)
+            cmd.append(str(imatrix_group))
         r = subprocess.run(cmd, input=arr.tobytes(), capture_output=True)
         if r.returncode != 0:
             raise RuntimeError(f"quantize-raw failed for {new_name} ({qtype.name}): {r.stderr.decode().strip()}")
