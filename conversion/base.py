@@ -1258,27 +1258,43 @@ class ModelBase:
 
     @property
     def _source_readers(self):
-        # lazily open the source GGUFs (memory-mapped, cheap) and index their tensors by name
+        # lazily open the source GGUFs (memory-mapped, cheap) and index their tensors by name.
+        # a split source (<base>-NNNNN-of-MMMMM.gguf) loads all of its shards
         cached = getattr(self, "_source_readers_cache", None)
         if cached is not None:
             return cached
         from gguf import GGUFReader
         readers = []
         for path in self.tensor_sources:
-            reader = GGUFReader(path)
-            reader.tensors_by_name = {t.name: t for t in reader.tensors}
-            readers.append(reader)
+            for p in self._expand_split_source(path):
+                reader = GGUFReader(p)
+                reader.tensors_by_name = {t.name: t for t in reader.tensors}
+                readers.append(reader)
         self._source_readers_cache = readers
         return readers
 
-    def _copy_from_source(self, gguf_name: str, expected_shape: tuple[int, ...] | None = None):
-        # return (raw_bytes, qtype) if the tensor is in a source model with a matching shape, else None.
-        # the copied tensor keeps the source's quant type, so no imatrix is needed for it
+    @staticmethod
+    def _expand_split_source(path: str) -> list[str]:
+        # a split GGUF shard (<base>-NNNNN-of-MMMMM.gguf) expands to all of its shards; the file
+        # name reflects the dominant bpw, not the mixed types inside, so load every shard
+        m = re.match(r"^(.*)-(\d+)-of-(\d+)\.gguf$", path)
+        if not m:
+            return [path]
+        base, total = m.group(1), int(m.group(3))
+        return [f"{base}-{i:05d}-of-{total:05d}.gguf" for i in range(1, total + 1)]
+
+    def _copy_from_source(self, gguf_name: str, expected_shape: tuple[int, ...] | None = None,
+                          target_qtype: gguf.GGMLQuantizationType | None = None):
+        # return (raw_bytes, qtype) if the tensor is in a source model with a matching shape and
+        # (when target_qtype is given) a matching quant type, else None. the copied tensor keeps
+        # the source's quant type, so no imatrix is needed for it
         for reader in self._source_readers:
             rt = reader.tensors_by_name.get(gguf_name)
             if rt is None:
                 continue
             if expected_shape is not None and tuple(int(d) for d in rt.shape) != tuple(expected_shape):
+                continue
+            if target_qtype is not None and rt.tensor_type != target_qtype:
                 continue
             return rt.data, rt.tensor_type
         return None

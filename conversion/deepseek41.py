@@ -228,15 +228,16 @@ class DeepseekV41Model(DeepseekV4Model):
         cols = packed_cols * 2
 
         gguf_name = self.format_tensor_name(key, bid)
-        # copy the pre-quantized experts from a source model if available (avoids re-quantizing)
+        data_qtype = self._expert_tensor_type(gguf_name, cols)
+        # copy the pre-quantized experts from a source model if it has them with the same type
+        # (avoids re-quantizing); a type mismatch (e.g. source Q5_K vs target Q6_K) falls through
         if self.tensor_sources:
-            copied = self._copy_from_source(gguf_name, (n_expert, rows, cols))
+            copied = self._copy_from_source(gguf_name, (n_expert, rows, cols), data_qtype)
             if copied is not None:
                 data, src_qtype = copied
                 logger.info(f"{gguf_name}: {n_expert} experts copied from source as {src_qtype.name}")
                 self.gguf_writer.add_tensor(gguf_name, data, raw_dtype=src_qtype)
                 return
-        data_qtype = self._expert_tensor_type(gguf_name, cols)
         logger.info(f"{gguf_name}: {n_expert} experts -> {data_qtype.name}")
 
         def dequant(eid: int) -> np.ndarray:
