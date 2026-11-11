@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
@@ -240,13 +241,26 @@ class DeepseekV41Model(DeepseekV4Model):
             self.gguf_writer.add_tensor(gguf_name, out, raw_dtype=data_qtype)
             return
 
+        from concurrent.futures import ThreadPoolExecutor
         from gguf.constants import GGML_QUANT_SIZES
         block, tsize = GGML_QUANT_SIZES[data_qtype]
         qcols = cols // block * tsize
         buf = np.empty((n_expert, rows, qcols), dtype=np.uint8)
-        for eid in range(n_expert):
+
+        def quantize_one(eid: int) -> tuple[int, np.ndarray]:
             q, _ = self._quantize_with_helper(torch.from_numpy(dequant(eid)), gguf_name, data_qtype, imatrix_group=eid)
-            buf[eid] = q
+            return eid, q
+
+        # experts are independent: quantize them in parallel across cores (each worker runs its
+        # own quantize-raw subprocess; the GIL is released while it runs). tune with HF_GGUF_EXPERT_THREADS
+        n_workers = int(os.environ.get("HF_GGUF_EXPERT_THREADS", min(os.cpu_count() or 4, 16)))
+        if n_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                for eid, q in ex.map(quantize_one, range(n_expert)):
+                    buf[eid] = q
+        else:
+            for eid in range(n_expert):
+                buf[eid] = quantize_one(eid)[1]
         self.gguf_writer.add_tensor(gguf_name, buf, raw_dtype=data_qtype)
 
     def _expert_tensor_type(self, gguf_name: str, ncols: int) -> gguf.GGMLQuantizationType:
