@@ -1229,8 +1229,13 @@ class ModelBase:
     def _quantize_with_helper(self, data_torch: Tensor, new_name: str, qtype: gguf.GGMLQuantizationType) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
         import subprocess
         arr = data_torch.detach().to(torch.float32).contiguous().numpy()
+        orig_shape = arr.shape
+        orig_ndim = arr.ndim
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
+        elif arr.ndim > 2:
+            # MoE experts are 3D [n_expert, rows, cols]; quantize row-major, restore the shape after
+            arr = arr.reshape(-1, arr.shape[-1])
         nrows, npr = arr.shape
         # ensure npr is compatible with the quant block size
         qtype = quant_mix.tensor_type_fallback("", npr, qtype)
@@ -1241,7 +1246,10 @@ class ModelBase:
             raise RuntimeError(f"quantize-raw failed for {new_name} ({qtype.name}): {r.stderr.decode().strip()}")
         from gguf.constants import GGML_QUANT_SIZES
         block, tsize = GGML_QUANT_SIZES[qtype]
-        return np.frombuffer(r.stdout, dtype=np.uint8).reshape(nrows, npr // block * tsize), qtype
+        out = np.frombuffer(r.stdout, dtype=np.uint8).reshape(nrows, npr // block * tsize)
+        if orig_ndim > 2:
+            out = out.reshape(orig_shape[:-1] + (npr // block * tsize,))
+        return out, qtype
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if name in self._fp8_e4m3_preserved and n_dims >= 2:
