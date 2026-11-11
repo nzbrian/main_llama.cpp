@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
 
@@ -247,20 +248,39 @@ class DeepseekV41Model(DeepseekV4Model):
         qcols = cols // block * tsize
         buf = np.empty((n_expert, rows, qcols), dtype=np.uint8)
 
+        # log progress every N seconds (default 60); a projection of 384 experts takes minutes
+        done = [0]
+        done_lock = threading.Lock()
+        stop = threading.Event()
+        interval = float(os.environ.get("HF_GGUF_PROGRESS_INTERVAL", 60))
+        def progress_loop() -> None:
+            while not stop.wait(interval):
+                with done_lock:
+                    n = done[0]
+                logger.info(f"{gguf_name}: {n}/{n_expert} experts done")
+        progress = threading.Thread(target=progress_loop, daemon=True)
+        progress.start()
+
         def quantize_one(eid: int) -> tuple[int, np.ndarray]:
             q, _ = self._quantize_with_helper(torch.from_numpy(dequant(eid)), gguf_name, data_qtype, imatrix_group=eid)
+            with done_lock:
+                done[0] += 1
             return eid, q
 
         # experts are independent: quantize them in parallel across cores (each worker runs its
         # own quantize-raw subprocess; the GIL is released while it runs). tune with HF_GGUF_EXPERT_THREADS
         n_workers = int(os.environ.get("HF_GGUF_EXPERT_THREADS", min(os.cpu_count() or 4, 16)))
-        if n_workers > 1:
-            with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                for eid, q in ex.map(quantize_one, range(n_expert)):
-                    buf[eid] = q
-        else:
-            for eid in range(n_expert):
-                buf[eid] = quantize_one(eid)[1]
+        try:
+            if n_workers > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    for eid, q in ex.map(quantize_one, range(n_expert)):
+                        buf[eid] = q
+            else:
+                for eid in range(n_expert):
+                    buf[eid] = quantize_one(eid)[1]
+        finally:
+            stop.set()
+            progress.join(timeout=1)
         self.gguf_writer.add_tensor(gguf_name, buf, raw_dtype=data_qtype)
 
     def _expert_tensor_type(self, gguf_name: str, ncols: int) -> gguf.GGMLQuantizationType:

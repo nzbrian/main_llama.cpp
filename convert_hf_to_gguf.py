@@ -214,10 +214,11 @@ def main() -> None:
         print_registered_models()
         sys.exit(0)
 
+    log_format = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
     if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.DEBUG, format=log_format, datefmt="%H:%M:%S")
     else:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format=log_format, datefmt="%H:%M:%S")
 
     if args.remote:
         hf_repo_id = args.model
